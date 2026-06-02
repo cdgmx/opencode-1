@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
+import { freemem, loadavg, tmpdir, totalmem } from "node:os"
 import path from "node:path"
 import { testProviderConfig } from "../test/lib/test-provider"
 
@@ -38,6 +38,20 @@ type ProcessSample = {
   command: string
 }
 
+type HostSample = {
+  time: string
+  elapsed_ms: number
+  load_avg_1m: number
+  load_avg_5m: number
+  load_avg_15m: number
+  memory_total_mb: number
+  memory_used_mb: number
+  memory_free_mb: number
+  memory_used_percent: number
+  swap_used_mb: number
+  swap_total_mb: number
+}
+
 type ProcessKind = "wrapper" | "opencode" | "lsp" | "shell" | "git" | "watcher" | "other"
 
 const opencodeRoot = path.resolve(import.meta.dir, "..")
@@ -74,12 +88,14 @@ async function runOnce(args: Args, artifactName: string) {
     const stdout = procs.map((proc) => readStream(proc.stdout))
     const stderr = procs.map((proc) => readStream(proc.stderr))
     const samples: ProcessSample[] = []
+    const hostSamples: HostSample[] = []
     const sampler = sampleProcesses(
       procs.map((proc) => proc.pid),
       samples,
       start,
       args.sampleMs,
     )
+    const hostSampler = sampleHost(hostSamples, start, args.sampleMs)
     const stopWhenSettled = stopInteractiveWhenSettled(args, procs, server)
     const timeout = setTimeout(() => {
       for (const proc of procs) proc.kill()
@@ -88,12 +104,14 @@ async function runOnce(args: Args, artifactName: string) {
     clearTimeout(timeout)
     stopWhenSettled?.()
     clearInterval(sampler)
+    clearInterval(hostSampler)
 
     const stdoutText = (await Promise.all(stdout)).join("\n")
     const stderrText = (await Promise.all(stderr)).join("\n")
     await writeFile(path.join(artifactDir, "stdout.log"), stdoutText)
     await writeFile(path.join(artifactDir, "stderr.log"), stderrText)
     await writeFile(path.join(artifactDir, "processes.jsonl"), samples.map((sample) => JSON.stringify(sample)).join("\n") + "\n")
+    await writeFile(path.join(artifactDir, "host.jsonl"), hostSamples.map((sample) => JSON.stringify(sample)).join("\n") + "\n")
     await writeFile(
       path.join(artifactDir, "metrics.jsonl"),
       [{ type: "run", time: new Date().toISOString(), exit_codes: exitCodes }, ...server.metrics].map((item) => JSON.stringify(item)).join("\n") + "\n",
@@ -108,6 +126,7 @@ async function runOnce(args: Args, artifactName: string) {
       stdoutText,
       stderrText,
       samples,
+      hostSamples,
     })
     await writeFile(path.join(artifactDir, "run.json"), JSON.stringify({ args, env: { home, homes, workspace, llm_url: `http://127.0.0.1:${port}` } }, null, 2))
     await writeFile(path.join(artifactDir, "summary.json"), JSON.stringify(summary, null, 2))
@@ -312,6 +331,83 @@ function sampleProcesses(parentPids: number[], samples: ProcessSample[], start: 
   return setInterval(() => void collect(), sampleMs)
 }
 
+function sampleHost(samples: HostSample[], start: number, sampleMs: number) {
+  const collect = async () => {
+    samples.push(await hostSample(start))
+  }
+  void collect()
+  return setInterval(() => void collect(), sampleMs)
+}
+
+async function hostSample(start: number): Promise<HostSample> {
+  const memory = process.platform === "darwin" ? await macMemory() : fallbackMemory()
+  const load = loadavg()
+  return {
+    time: new Date().toISOString(),
+    elapsed_ms: Math.round(performance.now() - start),
+    load_avg_1m: Number((load[0] ?? 0).toFixed(2)),
+    load_avg_5m: Number((load[1] ?? 0).toFixed(2)),
+    load_avg_15m: Number((load[2] ?? 0).toFixed(2)),
+    memory_total_mb: memory.total_mb,
+    memory_used_mb: memory.used_mb,
+    memory_free_mb: memory.free_mb,
+    memory_used_percent: memory.used_percent,
+    swap_used_mb: memory.swap_used_mb,
+    swap_total_mb: memory.swap_total_mb,
+  }
+}
+
+async function macMemory() {
+  const vm = await commandOutput(["vm_stat"])
+  const swap = await commandOutput(["sysctl", "-n", "vm.swapusage"])
+  if (!vm) return fallbackMemory()
+
+  const pageSize = Number(vm.match(/page size of (\d+) bytes/)?.[1] ?? "4096")
+  const pages = Object.fromEntries(
+    vm
+      .split("\n")
+      .map((line) => line.match(/^Pages (.+):\s+([\d.]+)\.?$/))
+      .filter((match): match is RegExpMatchArray => match !== null)
+      .map((match) => [match[1]!.toLowerCase().replace(/\s+/g, "_"), Number(match[2])]),
+  )
+  const free = ((pages.free ?? 0) + (pages.speculative ?? 0)) * pageSize
+  const total = totalmem()
+  const used = Math.max(0, total - free)
+  const swapUsed = Number(swap?.match(/used = ([\d.]+)M/)?.[1] ?? 0)
+  const swapTotal = Number(swap?.match(/total = ([\d.]+)M/)?.[1] ?? 0)
+
+  return {
+    total_mb: bytesToMb(total),
+    used_mb: bytesToMb(used),
+    free_mb: bytesToMb(free),
+    used_percent: percent(used, total),
+    swap_used_mb: swapUsed,
+    swap_total_mb: swapTotal,
+  }
+}
+
+function fallbackMemory() {
+  const free = freemem()
+  const total = totalmem()
+  const used = Math.max(0, total - free)
+  return {
+    total_mb: bytesToMb(total),
+    used_mb: bytesToMb(used),
+    free_mb: bytesToMb(free),
+    used_percent: percent(used, total),
+    swap_used_mb: 0,
+    swap_total_mb: 0,
+  }
+}
+
+async function commandOutput(command: string[]) {
+  const proc = Bun.spawn(command, { stdout: "pipe", stderr: "ignore" })
+  const output = await new Response(proc.stdout).text()
+  const exit = await proc.exited
+  if (exit !== 0) return
+  return output
+}
+
 async function processTable() {
   const proc = Bun.spawn(["ps", "-axo", "pid=,ppid=,pcpu=,rss=,comm="], { stdout: "pipe", stderr: "ignore" })
   const output = await new Response(proc.stdout).text()
@@ -393,9 +489,11 @@ function summarize(input: {
   stdoutText: string
   stderrText: string
   samples: ProcessSample[]
+  hostSamples: HostSample[]
 }) {
   const parent = input.samples.filter((sample) => sample.role === "parent")
   const child = input.samples.filter((sample) => sample.role === "child")
+  const trackedRss = totalRssBySample(input.samples)
   return {
     scenario: input.args.scenario,
     mode: input.args.mode,
@@ -404,6 +502,8 @@ function summarize(input: {
     avg_cpu: avg(parent.map((sample) => sample.cpu)),
     max_rss_mb: max(parent.map((sample) => sample.rss_mb)),
     avg_rss_mb: avg(parent.map((sample) => sample.rss_mb)),
+    tracked_max_total_rss_mb: max(trackedRss),
+    tracked_avg_total_rss_mb: avg(trackedRss),
     child_max_cpu: max(child.map((sample) => sample.cpu)),
     child_max_rss_mb: max(child.map((sample) => sample.rss_mb)),
     child_process_count: new Set(child.map((sample) => sample.pid)).size,
@@ -411,6 +511,10 @@ function summarize(input: {
     child_process_kind_counts: countUniqueByKind(child),
     child_kind_max_rss_mb: maxByKind(child, (sample) => sample.rss_mb),
     child_kind_max_cpu: maxByKind(child, (sample) => sample.cpu),
+    host_max_memory_used_mb: max(input.hostSamples.map((sample) => sample.memory_used_mb)),
+    host_max_memory_used_percent: max(input.hostSamples.map((sample) => sample.memory_used_percent)),
+    host_max_swap_used_mb: max(input.hostSamples.map((sample) => sample.swap_used_mb)),
+    host_max_load_avg_1m: max(input.hostSamples.map((sample) => sample.load_avg_1m)),
     llm_requests: input.llmRequests,
     delta_chunks: deltaChunks(input.args),
     chunks_per_second: Number((deltaChunks(input.args) / (input.durationMs / 1000)).toFixed(2)),
@@ -472,6 +576,15 @@ function countUniqueByKind(samples: ProcessSample[]) {
   ) as Record<ProcessKind, number>
 }
 
+function totalRssBySample(samples: ProcessSample[]) {
+  return Object.values(
+    samples.reduce<Record<string, number>>(
+      (result, sample) => ({ ...result, [sample.elapsed_ms]: (result[sample.elapsed_ms] ?? 0) + sample.rss_mb }),
+      {},
+    ),
+  ).map((value) => Number(value.toFixed(2)))
+}
+
 function maxByKind(samples: ProcessSample[], value: (sample: ProcessSample) => number) {
   return samples.reduce<Record<ProcessKind, number>>(
     (result, sample) => ({ ...result, [sample.kind]: Math.max(result[sample.kind], value(sample)) }),
@@ -507,6 +620,15 @@ function nonNegativeInt(value: string, name: string) {
 
 function deltaChunks(args: Args) {
   return args.chunks + (args.scenario === "reasoning-burst" ? args.reasoningChunks : 0)
+}
+
+function bytesToMb(value: number) {
+  return Number((value / 1024 / 1024).toFixed(2))
+}
+
+function percent(value: number, total: number) {
+  if (total === 0) return 0
+  return Number(((value / total) * 100).toFixed(2))
 }
 
 function avg(values: number[]) {

@@ -1,5 +1,14 @@
 # OpenCode Runtime Performance Results
 
+HTML comparison report: `perf/opencode-runtime-performance-report.html`.
+
+Regenerate after new runs:
+
+```sh
+cd packages/opencode
+bun run perf:report .artifacts/perf/20260602T160141Z-multi-instance-slow-stream-run-1 .artifacts/perf/20260602T160421Z-multi-instance-slow-stream-run-1
+```
+
 ## 2026-06-02: 6-Instance Real-Workspace Repro
 
 Goal: determine whether 5-10 concurrent OpenCode instances show CPU pressure, memory pressure, or shared-home database contention when using mocked LLM streams.
@@ -67,10 +76,66 @@ Interpretation: shared-home concurrent startup can race database migration/index
 ## Current Conclusion
 
 - CPU/process pressure: supported by 6-instance isolated run.
-- Memory pressure: inconclusive; shared-home peak RSS reached about 1GB, but that run was corrupted by migration failures.
+- Memory pressure: supported at host level during retest, but not fully attributable to OpenCode because baseline host pressure was already high before the workload warmed up.
 - Database contention: strongly supported; shared-home runs have reproduced both `database is locked` and duplicate-index migration failures.
 - LSP pressure: not proven; `--enable-lsp` currently still reports `lsp: 0`, so the harness needs stronger LSP triggering.
 
 ## Next Verification Step
 
-Add host-level macOS pressure sampling during 6-10 instance runs: total CPU, load average, memory pressure, swap usage, and per-process RSS/CPU over time.
+Capture a quiet-machine baseline, then rerun 6-10 instance isolated homes to separate pre-existing macOS memory pressure from OpenCode-induced pressure.
+
+## 2026-06-02: Host Memory Sampling Retest
+
+Change: perf harness now writes `host.jsonl` with macOS `vm_stat`, `vm.swapusage`, and load average samples, and `summary.json` includes tracked total RSS plus host memory/swap/load peaks.
+
+### Isolated Homes With Host Samples
+
+Artifact: `packages/opencode/.artifacts/perf/20260602T161634Z-multi-instance-slow-stream-run-1`
+
+Result:
+
+| Metric | Value |
+| --- | ---: |
+| Duration | `153.337s` |
+| Exit codes | `[143, 143, 143, 143, 143, 143]` |
+| Unique child processes | `84` |
+| OpenCode child count | `6` |
+| Git child count | `43` |
+| Peak tracked total RSS | `2331.8MB` |
+| Peak OpenCode RSS | `468.06MB` |
+| Peak OpenCode CPU | `130.3%` |
+| Host peak memory used | `99.86%` / `16361.84MB` |
+| Host peak swap used | `9918.19MB` |
+| Host peak 1m load avg | `26.98` |
+| LSP count | `0` |
+
+Host baseline note: first host sample was already `97.9%` memory used with `7617MB` swap, so this proves the run occurred under memory pressure but does not by itself prove OpenCode caused all of it.
+
+### Shared Home With Host Samples
+
+Artifact: `packages/opencode/.artifacts/perf/20260602T161916Z-multi-instance-slow-stream-run-1`
+
+Result:
+
+| Metric | Value |
+| --- | ---: |
+| Duration | `180.036s` |
+| Exit codes | `[1, 143, 1, 1, 1, 1]` |
+| Unique child processes | `13` |
+| OpenCode child count | `6` |
+| Git child count | `5` |
+| Peak tracked total RSS | `1842.47MB` |
+| Peak OpenCode RSS | `877.75MB` |
+| Peak OpenCode CPU | `189.3%` |
+| Host peak memory used | `99.71%` / `16336.81MB` |
+| Host peak swap used | `8542.19MB` |
+| Host peak 1m load avg | `11.78` |
+| LSP count | `0` |
+
+Observed stdout error:
+
+```text
+database is locked
+```
+
+Interpretation: shared-home still fails before a clean steady-state workload. This keeps database contention as the strongest shared-home finding. Memory pressure is real on the host, but the shared-home run remains invalid for isolating memory as the primary lag cause.
