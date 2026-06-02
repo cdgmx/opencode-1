@@ -768,10 +768,7 @@ export const RunCommand = effectCmd({
 
         if (!args.interactive) {
           const events = await client.event.subscribe()
-          loop(client, events).catch((e) => {
-            console.error(e)
-            process.exit(1)
-          })
+          const eventLoop = loop(client, events)
 
           if (args.command) {
             const result = await client.session.command({
@@ -786,6 +783,7 @@ export const RunCommand = effectCmd({
               if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
               process.exitCode = 1
             }
+            await eventLoop
             return
           }
 
@@ -801,6 +799,7 @@ export const RunCommand = effectCmd({
             if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
             process.exitCode = 1
           }
+          await eventLoop
           return
         }
 
