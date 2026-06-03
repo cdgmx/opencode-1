@@ -20,6 +20,7 @@ import { resolveModelInfo, resolveRunTuiConfig, resolveSessionInfo } from "./run
 import { createRuntimeLifecycle } from "./runtime.lifecycle"
 import { recordRunSpanError, setRunSpanAttributes, withRunSpan } from "./otel"
 import { writePerfHeapSnapshot } from "./perf.heap"
+import { markPerfTiming } from "./perf.timing"
 import { trace } from "./trace"
 import { cycleVariant, formatModelLabel, resolveSavedVariant, resolveVariant, saveVariant } from "./variant.shared"
 import type { LocalReplayAnchor, LocalReplayRow, RunInput, RunPrompt, RunProvider, StreamCommit } from "./types"
@@ -382,6 +383,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
       })
       const footer = shell.footer
       writePerfHeapSnapshot("boot")
+      markPerfTiming("boot_complete")
       const rememberLocal = (commit: StreamCommit, after?: LocalReplayAnchor) => {
         state.localRows = [...state.localRows, { commit, after }].slice(-LOCAL_REPLAY_ROW_LIMIT)
       }

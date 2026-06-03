@@ -31,6 +31,7 @@ import { createComponent, createSignal, type Accessor, type Setter } from "solid
 import { createStore, reconcile } from "solid-js/store"
 import { OpencodeKeymapProvider, formatKeyBindings } from "@/cli/cmd/tui/keymap"
 import { withRunSpan } from "./otel"
+import { markPerfTiming } from "./perf.timing"
 import { RUN_COMMAND_PANEL_ROWS, RUN_SUBAGENT_PANEL_ROWS } from "./footer.command"
 import { SUBAGENT_INSPECTOR_ROWS } from "./footer.subagent"
 import { PROMPT_MAX_ROWS, TEXTAREA_MIN_ROWS } from "./footer.prompt"
@@ -104,6 +105,31 @@ const SUBAGENT_ROWS = RUN_SUBAGENT_PANEL_ROWS
 const MODEL_ROWS = RUN_COMMAND_PANEL_ROWS
 const VARIANT_ROWS = RUN_COMMAND_PANEL_ROWS
 const AUTOCOMPLETE_COMPACT_ROWS = 2
+
+function resolveMarkdownFinalizeMode() {
+  const value = process.env.OPENCODE_RUN_TUI_MD_FINALIZE_MODE ?? "immediate"
+  if (value === "immediate") {
+    return { kind: "immediate" as const }
+  }
+
+  if (value === "never") {
+    return { kind: "never" as const }
+  }
+
+  if (!value.startsWith("defer:")) {
+    return { kind: "immediate" as const }
+  }
+
+  const delayMs = Number(value.slice("defer:".length))
+  if (!Number.isInteger(delayMs) || delayMs < 0) {
+    return { kind: "immediate" as const }
+  }
+
+  return {
+    kind: "defer" as const,
+    delayMs,
+  }
+}
 
 function createEmptySubagentState(): FooterSubagentState {
   return {
@@ -204,6 +230,8 @@ export class RunFooter implements FooterApi {
   private exitTimeout: NodeJS.Timeout | undefined
   private requestExitHandler: (() => boolean) | undefined
   private scrollback: RunScrollbackStream
+  private completeScrollbackTimer: ReturnType<typeof setTimeout> | undefined
+  private readonly markdownFinalizeMode = resolveMarkdownFinalizeMode()
 
   private createScrollback(wrote: boolean): RunScrollbackStream {
     return new RunScrollbackStream(this.renderer, this.options.theme, {
@@ -451,7 +479,7 @@ export class RunFooter implements FooterApi {
 
     if (prev.phase === "running" && state.phase === "idle") {
       this.flush()
-      this.completeScrollback()
+      this.scheduleCompleteScrollback()
     }
   }
 
@@ -466,13 +494,36 @@ export class RunFooter implements FooterApi {
             "session.id": this.options.sessionID() || undefined,
           },
           async () => {
+            markPerfTiming("final_rich_start")
             await this.scrollback.complete()
+            markPerfTiming("final_rich_done")
           },
         ),
       )
       .catch((error) => {
         this.flushError = error
       })
+  }
+
+  private scheduleCompleteScrollback(): void {
+    if (this.markdownFinalizeMode.kind === "never") {
+      return
+    }
+
+    if (this.completeScrollbackTimer) {
+      clearTimeout(this.completeScrollbackTimer)
+      this.completeScrollbackTimer = undefined
+    }
+
+    if (this.markdownFinalizeMode.kind === "immediate") {
+      this.completeScrollback()
+      return
+    }
+
+    this.completeScrollbackTimer = setTimeout(() => {
+      this.completeScrollbackTimer = undefined
+      this.completeScrollback()
+    }, this.markdownFinalizeMode.delayMs)
   }
 
   private present(view: FooterView): void {
@@ -526,7 +577,7 @@ export class RunFooter implements FooterApi {
 
     this.flush()
     if (this.state().phase === "idle") {
-      this.completeScrollback()
+      this.scheduleCompleteScrollback()
     }
 
     return this.flushing.then(async () => {
@@ -926,6 +977,10 @@ export class RunFooter implements FooterApi {
     this.flush()
     this.destroyed = true
     this.notifyClose()
+    if (this.completeScrollbackTimer) {
+      clearTimeout(this.completeScrollbackTimer)
+      this.completeScrollbackTimer = undefined
+    }
     this.clearInterruptTimer()
     this.clearExitTimer()
     this.renderer.off(CliRenderEvents.DESTROY, this.handleDestroy)

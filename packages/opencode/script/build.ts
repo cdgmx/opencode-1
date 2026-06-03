@@ -17,7 +17,7 @@ const generated = await import("./generate.ts")
 import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
 
-const singleFlag = process.argv.includes("--single")
+const singleFlag = process.argv.includes("--single") || process.argv.includes("--host-only")
 const baselineFlag = process.argv.includes("--baseline")
 const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")

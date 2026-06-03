@@ -16,6 +16,7 @@ import {
 } from "@opentui/core"
 import { entryBody, entryCanStream, entryDone, entryFlags } from "./entry.body"
 import { withRunSpan } from "./otel"
+import { markPerfTiming } from "./perf.timing"
 import { entryColor, entryLook, entrySyntax } from "./scrollback.shared"
 import { entryWriter, sameEntryGroup, separatorRows, spacerWriter } from "./scrollback.writer"
 import { type RunTheme } from "./theme"
@@ -84,6 +85,19 @@ function staticBody(commit: StreamCommit, body: RunEntryBody, spaced: number): R
     ...body,
     content: body.content.replace(/^\n/, ""),
   }
+}
+
+function shouldTrackVisibleTiming(commit: StreamCommit) {
+  return commit.kind === "assistant" || commit.kind === "reasoning" || commit.kind === "tool"
+}
+
+function markVisibleTiming(commit: StreamCommit) {
+  if (!shouldTrackVisibleTiming(commit)) {
+    return
+  }
+
+  markPerfTiming("first_visible")
+  markPerfTiming("last_visible")
 }
 
 export class RunScrollbackStream {
@@ -230,6 +244,7 @@ export class RunScrollbackStream {
       active.surface.commitRows(active.committedRows, targetRows, {
         trailingNewline: done && targetRows === active.surface.height ? trailingNewline : false,
       })
+      markVisibleTiming(active.commit)
       active.committedRows = targetRows
       active.rendered = true
       return true
@@ -253,6 +268,7 @@ export class RunScrollbackStream {
       active.surface.commitRows(active.committedRows, targetRows, {
         trailingNewline: done && targetRows === active.surface.height ? trailingNewline : false,
       })
+      markVisibleTiming(active.commit)
       active.committedRows = targetRows
       active.rendered = true
       return true
@@ -281,6 +297,7 @@ export class RunScrollbackStream {
         beforeCommit: () => this.flushPendingSpacer(active),
       })
     ) {
+      markVisibleTiming(active.commit)
       active.committedBlocks = targetBlockCount
       active.rendered = true
       return true
@@ -381,6 +398,7 @@ export class RunScrollbackStream {
         },
       }),
     )
+    markVisibleTiming(commit)
     this.markRendered(commit)
     this.tail = commit
   }

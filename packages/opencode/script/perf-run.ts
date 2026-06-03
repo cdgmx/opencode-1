@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { testProviderConfig } from "../test/lib/test-provider"
@@ -11,6 +11,8 @@ type Args = {
   mode: Mode
   scenario: Scenario
   runner: Runner
+  mdFinalizeMode: string
+  perfTiming: boolean
   smol: boolean
   cpuProfile: boolean
   workspace?: string
@@ -52,6 +54,7 @@ type Summary = {
   scenario: Scenario
   mode: Mode
   runner: Runner
+  md_finalize_mode: string
   smol: boolean
   attach: boolean
   warm_home: boolean
@@ -73,6 +76,20 @@ type Summary = {
   llm_requests: number
   sample_count: number
   exit_code: number | number[]
+  timing_instances: number
+  boot_complete_ms?: number
+  first_visible_ms?: number
+  last_visible_ms?: number
+  final_rich_done_ms?: number
+  finalization_tail_ms?: number
+}
+
+type PerfTimingName = "boot_complete" | "first_visible" | "last_visible" | "final_rich_start" | "final_rich_done"
+
+type PerfTimingEvent = {
+  instance: string
+  name: PerfTimingName
+  ms: number
 }
 
 const opencodeRoot = path.resolve(import.meta.dir, "..")
@@ -146,12 +163,14 @@ async function runOnce(args: Args, artifactName: string) {
 
     const stdoutText = (await Promise.all(stdout)).join("\n")
     const stderrText = (await Promise.all(stderr)).join("\n")
+    const timingText = await readFile(path.join(artifactDir, "timings.jsonl"), "utf8").catch(() => "")
     const summary = summarize({
       args,
       durationMs: Math.round(performance.now() - start),
       exitCode: args.instances === 1 ? exitCode[0]! : exitCode,
       llmRequests: llm.requestCount,
       samples,
+      timings: parsePerfTimings(timingText || stderrText),
     })
 
     await writeFile(
@@ -230,9 +249,24 @@ async function availablePort() {
 }
 
 async function waitForServer(server: OpencodeServer) {
-  await Bun.sleep(20_000)
-  if (server.proc.exitCode === null) return
-  throw new Error(`opencode server exited before clients could attach at ${server.url}`)
+  const timeoutAt = performance.now() + 20_000
+  const healthUrl = `${server.url}/global/health`
+  while (performance.now() < timeoutAt) {
+    if (server.proc.exitCode !== null) {
+      throw new Error(`opencode server exited before clients could attach at ${server.url}`)
+    }
+
+    const ready = await fetch(healthUrl)
+      .then((response) => response.ok)
+      .catch(() => false)
+    if (ready) {
+      return
+    }
+
+    await Bun.sleep(100)
+  }
+
+  throw new Error(`opencode server did not become ready at ${server.url}`)
 }
 
 function spawnOpencode(args: Args, env: Record<string, string>, workspace: string, attachUrl: string | undefined) {
@@ -674,6 +708,7 @@ function isolatedEnv(args: Args, home: string, llmUrl: string, perf?: { artifact
     OPENCODE_DISABLE_LSP_DOWNLOAD: args.disableLspDownload ? "1" : "0",
     OPENCODE_EXPERIMENTAL_LSP_TOOL: args.scenario === "lsp-ts" ? "1" : "0",
     OPENCODE_AUTH_CONTENT: "{}",
+    OPENCODE_RUN_TUI_MD_FINALIZE_MODE: args.mdFinalizeMode,
   }
 
   if (!perf) {
@@ -682,11 +717,19 @@ function isolatedEnv(args: Args, home: string, llmUrl: string, perf?: { artifact
 
   return {
     ...env,
+    OPENCODE_PERF_INSTANCE: String(perf.index + 1),
+    ...(args.mode === "tui"
+      ? args.perfTiming
+        ? {
+          OPENCODE_PERF_TIMING: "1",
+          OPENCODE_PERF_TIMING_FILE: path.join(perf.artifactDir, "timings.jsonl"),
+        }
+        : {}
+      : {}),
     ...(args.memoryCheckpoints && perf.index < args.memoryInstances
         ? {
             OPENCODE_PERF_MEMORY_DIR: path.join(perf.artifactDir, "memory"),
             OPENCODE_PERF_MEMORY_CHECKPOINTS: args.memoryCheckpointNames,
-            OPENCODE_PERF_INSTANCE: String(perf.index + 1),
           }
       : {}),
     ...(args.heapSnapshots && perf.index < args.heapInstances
@@ -803,6 +846,7 @@ function summarize(input: {
   exitCode: number | number[]
   llmRequests: number
   samples: ProcessSample[]
+  timings: ReturnType<typeof parsePerfTimings>
 }): Summary {
   const targetSamples = primarySamples(input.args.mode, input.samples)
   const treeCpu = totalsByElapsed(input.samples, (sample) => sample.cpu)
@@ -817,6 +861,7 @@ function summarize(input: {
     scenario: input.args.scenario,
     mode: input.args.mode,
     runner: input.args.runner,
+    md_finalize_mode: input.args.mdFinalizeMode,
     smol: input.args.smol,
     attach: input.args.attach,
     warm_home: input.args.warmHome,
@@ -838,7 +883,70 @@ function summarize(input: {
     llm_requests: input.llmRequests,
     sample_count: targetSamples.length,
     exit_code: input.exitCode,
+    timing_instances: input.timings.timing_instances,
+    boot_complete_ms: input.timings.boot_complete_ms,
+    first_visible_ms: input.timings.first_visible_ms,
+    last_visible_ms: input.timings.last_visible_ms,
+    final_rich_done_ms: input.timings.final_rich_done_ms,
+    finalization_tail_ms: input.timings.finalization_tail_ms,
   }
+}
+
+function parsePerfTimings(stderrText: string) {
+  const events = stderrText
+    .split("\n")
+    .map((line) => line.trim())
+    .flatMap((line) => {
+      if (!line.startsWith('{"opencode_perf_timing":')) {
+        return []
+      }
+
+      const parsed = JSON.parse(line) as Partial<PerfTimingEvent> & { opencode_perf_timing?: boolean }
+      if (!parsed.opencode_perf_timing || typeof parsed.instance !== "string" || typeof parsed.name !== "string") {
+        return []
+      }
+
+      if (typeof parsed.ms !== "number" || !Number.isFinite(parsed.ms)) {
+        return []
+      }
+
+      return [{ instance: parsed.instance, name: parsed.name as PerfTimingName, ms: parsed.ms }]
+    })
+
+  const grouped = events.reduce<Record<string, PerfTimingEvent[]>>((result, event) => {
+    result[event.instance] = [...(result[event.instance] ?? []), event]
+    return result
+  }, {})
+
+  const instances = Object.values(grouped)
+  return {
+    timing_instances: instances.length,
+    boot_complete_ms: medianDefined(instances.flatMap((events) => firstTiming(events, "boot_complete"))),
+    first_visible_ms: medianDefined(instances.flatMap((events) => firstTiming(events, "first_visible"))),
+    last_visible_ms: medianDefined(instances.flatMap((events) => lastTiming(events, "last_visible"))),
+    final_rich_done_ms: medianDefined(instances.flatMap((events) => lastTiming(events, "final_rich_done"))),
+    finalization_tail_ms: medianDefined(
+      instances.flatMap((events) => {
+        const last = lastTiming(events, "last_visible")[0]
+        const final = lastTiming(events, "final_rich_done")[0]
+        if (last === undefined || final === undefined) {
+          return []
+        }
+
+        return [Math.max(0, final - last)]
+      }),
+    ),
+  }
+}
+
+function firstTiming(events: PerfTimingEvent[], name: PerfTimingName) {
+  const match = events.find((event) => event.name === name)
+  return match ? [match.ms] : []
+}
+
+function lastTiming(events: PerfTimingEvent[], name: PerfTimingName) {
+  const match = [...events].reverse().find((event) => event.name === name)
+  return match ? [match.ms] : []
 }
 
 function emptyKindRecord() {
@@ -899,6 +1007,7 @@ function printRun(index: number, summary: Summary, artifactDir: string) {
       `run ${index}`,
       `${summary.mode}/${summary.scenario}`,
       `runner=${summary.runner}`,
+      `md_finalize=${summary.md_finalize_mode}`,
       `smol=${summary.smol}`,
       `attach=${summary.attach}`,
       `warm_home=${summary.warm_home}`,
@@ -910,6 +1019,11 @@ function printRun(index: number, summary: Summary, artifactDir: string) {
       `avg_rss=${summary.avg_rss_mb}MB`,
       `tree_peak_cpu=${summary.tree_peak_cpu}%`,
       `tree_peak_rss=${summary.tree_peak_rss_mb}MB`,
+      ...(summary.boot_complete_ms === undefined ? [] : [`boot_complete=${summary.boot_complete_ms}ms`]),
+      ...(summary.first_visible_ms === undefined ? [] : [`first_visible=${summary.first_visible_ms}ms`]),
+      ...(summary.last_visible_ms === undefined ? [] : [`last_visible=${summary.last_visible_ms}ms`]),
+      ...(summary.final_rich_done_ms === undefined ? [] : [`final_rich_done=${summary.final_rich_done_ms}ms`]),
+      ...(summary.finalization_tail_ms === undefined ? [] : [`finalize_tail=${summary.finalization_tail_ms}ms`]),
       `exit=${summary.exit_code}`,
       `artifact=${artifactDir}`,
     ].join(" | "),
@@ -926,6 +1040,7 @@ function printAggregate(summaries: Summary[]) {
     [
       `${first.mode}/${first.scenario}`,
       `runner=${first.runner}`,
+      `md_finalize=${first.md_finalize_mode}`,
       `smol=${first.smol}`,
       `attach=${first.attach}`,
       `warm_home=${first.warm_home}`,
@@ -935,6 +1050,21 @@ function printAggregate(summaries: Summary[]) {
       `median_tree_peak_cpu=${median(summaries.map((summary) => summary.tree_peak_cpu))}%`,
       `median_tree_peak_rss=${median(summaries.map((summary) => summary.tree_peak_rss_mb))}MB`,
       `median_duration=${median(summaries.map((summary) => summary.duration_ms))}ms`,
+      ...(definedValues(summaries.map((summary) => summary.boot_complete_ms)).length === 0
+        ? []
+        : [`median_boot_complete=${medianDefined(summaries.map((summary) => summary.boot_complete_ms))}ms`]),
+      ...(definedValues(summaries.map((summary) => summary.first_visible_ms)).length === 0
+        ? []
+        : [`median_first_visible=${medianDefined(summaries.map((summary) => summary.first_visible_ms))}ms`]),
+      ...(definedValues(summaries.map((summary) => summary.last_visible_ms)).length === 0
+        ? []
+        : [`median_last_visible=${medianDefined(summaries.map((summary) => summary.last_visible_ms))}ms`]),
+      ...(definedValues(summaries.map((summary) => summary.final_rich_done_ms)).length === 0
+        ? []
+        : [`median_final_rich_done=${medianDefined(summaries.map((summary) => summary.final_rich_done_ms))}ms`]),
+      ...(definedValues(summaries.map((summary) => summary.finalization_tail_ms)).length === 0
+        ? []
+        : [`median_finalize_tail=${medianDefined(summaries.map((summary) => summary.finalization_tail_ms))}ms`]),
     ].join(" | "),
   )
 }
@@ -952,6 +1082,8 @@ function parseArgs(argv: string[]): Args {
     mode,
     scenario: enumValue(values.get("scenario") ?? "markdown", ["text", "markdown", "code", "read-ts", "lsp-ts", "task-ts"]),
     runner: enumValue(values.get("runner") ?? "source", ["source", "binary"]),
+    mdFinalizeMode: values.get("md-finalize-mode") ?? "immediate",
+    perfTiming: booleanValue(values.get("perf-timing") ?? "false", "perf-timing"),
     smol: booleanValue(values.get("smol") ?? "false", "smol"),
     cpuProfile: booleanValue(values.get("cpu-profile") ?? "false", "cpu-profile"),
     workspace: values.get("workspace"),
@@ -1021,6 +1153,19 @@ function median(values: number[]) {
   const middle = Math.floor(sorted.length / 2)
   if (sorted.length % 2 === 1) return Number(sorted[middle]!.toFixed(2))
   return Number((((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2).toFixed(2))
+}
+
+function definedValues(values: Array<number | undefined>) {
+  return values.filter((value): value is number => value !== undefined)
+}
+
+function medianDefined(values: Array<number | undefined>) {
+  const filtered = definedValues(values)
+  if (filtered.length === 0) {
+    return undefined
+  }
+
+  return median(filtered)
 }
 
 function stamp() {

@@ -579,6 +579,47 @@ These ideas were tested already. They did not materially lower top-line CPU, or 
   - do not rotate the active markdown surface at every stable-block boundary in the current implementation
   - next work should target scheduling/visibility metrics or a true two-lane plain-text-visible path, not more single-surface reset variants
 
+### Timing Split And Finalize-Mode Check
+
+- code change kept for investigation:
+  - `packages/opencode/src/cli/cmd/run/perf.timing.ts`
+  - `packages/opencode/src/cli/cmd/run/runtime.ts`
+  - `packages/opencode/src/cli/cmd/run/footer.ts`
+  - `packages/opencode/src/cli/cmd/run/scrollback.surface.ts`
+  - `packages/opencode/script/perf-run.ts`
+  - the perf harness now records `boot_complete`, `first_visible`, `last_visible`, `final_rich_done`, and `finalize_tail`
+  - new harness flag: `--md-finalize-mode immediate|never|defer:N`
+- why this was necessary:
+  - total `duration` was conflating visible output time, final rich completion, and harness settle/process tail
+  - we needed to separate “user can see the answer” from “process finally exited” before making more markdown architecture changes
+- binary validation after rebuilding the binary:
+  - `text` immediate: `20260603T223530Z-tui-text-run-1`
+    - `duration=16568ms`, `first_visible=5277ms`, `last_visible=5661.5ms`, `final_rich_done=5661.5ms`, `finalize_tail=0ms`
+  - `text` never: `20260603T223556Z-tui-text-run-1`
+    - `duration=16302ms`, `first_visible=5204.5ms`, `last_visible=5519.5ms`
+  - `task-ts` immediate: `20260603T223630Z-tui-task-ts-run-1`
+    - `duration=19738ms`, `first_visible=11056.5ms`, `last_visible=11316ms`, `final_rich_done=11317ms`, `finalize_tail=0ms`
+  - `task-ts` never: `20260603T223652Z-tui-task-ts-run-1`
+    - `duration=16531ms`, `first_visible=6907ms`, `last_visible=7198.5ms`
+  - `task-ts` defer `2000ms`: `20260603T223822Z-tui-task-ts-run-1`
+    - `duration=15941ms`, `first_visible=6307.5ms`, `last_visible=8677ms`, `final_rich_done=8678ms`, `finalize_tail=1ms`
+    - but CPU/RSS regressed badly: `tree_peak_cpu=738.7%`, `tree_peak_rss=3542.99MB`
+  - `lsp-ts` immediate: `20260603T223710Z-tui-lsp-ts-run-1`
+    - `duration=8142ms`, `first_visible=5465ms`, `last_visible=6195ms`, `final_rich_done=6196ms`, `finalize_tail=0.5ms`
+  - `lsp-ts` never: `20260603T223719Z-tui-lsp-ts-run-1`
+    - `duration=8201ms`, `first_visible=5590ms`, `last_visible=6249.5ms`
+- interpretation:
+  - end-of-stream rich finalization is **not** the main reason total `duration` is long in the current sticky path
+  - for `text` and `lsp-ts`, `final_rich_done` was effectively the same moment as `last_visible`; the big remaining gap was mostly harness/process tail after content was already visible
+  - therefore the old top-line `duration` number was overstating user-visible slowness in these scenarios
+  - `task-ts` is different: disabling finalization improved `first_visible` and `last_visible` materially, so finalize scheduling can still interfere with multi-phase tool/assistant turns even though the finalization call itself completes almost immediately once it runs
+  - coarse deferral (`defer:2000`) is not keepable because it worsened CPU/RSS sharply
+- keep rule:
+  - keep the timing split instrumentation and finalize-mode harness flag
+  - do not use total `duration` alone as the main success metric for streaming markdown changes anymore
+  - do not treat end-of-stream markdown finalization as the primary root cause for `text` or `lsp-ts`
+  - if finalization scheduling is revisited, target the `task-ts` multi-phase path specifically rather than generic end-of-stream markdown completion
+
 ## Repro Commands
 
 ```sh
