@@ -508,6 +508,7 @@ These ideas were tested already. They did not materially lower top-line CPU, or 
   - this makes the assistant heuristic a true one-way per-entry upgrade instead of a chunk-by-chunk toggle
 - validation:
   - source `text`: `20260603T213729Z-tui-text-run-1`, `tree_peak_cpu=296.2%`, `tree_peak_rss=2777.88MB`, `duration=73887ms`
+  - binary `text`: `20260603T220716Z-tui-text-run-1`, `tree_peak_cpu=610%`, `tree_peak_rss=2648.73MB`, `duration=17069ms`
   - binary `task-ts`: `20260603T213729Z-tui-task-ts-run-1`, `tree_peak_cpu=280.3%`, `tree_peak_rss=1561.35MB`, `duration=45873ms`
   - binary `lsp-ts`: `20260603T213729Z-tui-lsp-ts-run-1`, `tree_peak_cpu=298.9%`, `tree_peak_rss=2078.44MB`, `duration=68650ms`
 - comparison points:
@@ -517,10 +518,66 @@ These ideas were tested already. They did not materially lower top-line CPU, or 
 - interpretation:
   - this is the first refactor in this pass that appears to materially lower top-line CPU across `text`, `task-ts`, and `lsp-ts`
   - CPU and RSS both fell sharply in these validation runs
+  - later binary `text` validation did **not** reproduce the dramatic source-mode CPU collapse, but it still serves as the correct binary comparison point for later experiments in this family
   - important caveat: wall-clock duration increased a lot, so this may be trading throughput/latency for lower burst CPU
 - keep rule:
   - keep this assistant one-way upgrade for now as the strongest CPU-focused refactor signal so far
   - next work should explicitly evaluate whether the duration regression is acceptable or whether the implementation should preserve the CPU win while reducing throughput loss
+
+### Rejected Stable Markdown Prefix Trimming
+
+- follow-up hypothesis:
+  - after markdown blocks become stable and are committed to scrollback, trim that committed prefix out of the live `MarkdownRenderable` so later chunks only parse/layout the unfinished tail
+- diagnostic patch:
+  - `packages/opencode/src/cli/cmd/run/scrollback.surface.ts`
+  - computed the stable markdown token prefix length after `settle()`, sliced that prefix out of `active.content`, reset markdown parse state, and kept only the tail in the live renderable
+- validation:
+  - source `text`: `20260603T215908Z-tui-text-run-1`, `tree_peak_cpu=622.1%`, `tree_peak_rss=2859.01MB`, `duration=21325ms`
+  - binary `text`: `20260603T220751Z-tui-text-run-1`, `tree_peak_cpu=639.3%`, `tree_peak_rss=2586.17MB`, `duration=17959ms`
+  - binary `task-ts`: `20260603T215935Z-tui-task-ts-run-1`, `tree_peak_cpu=685.5%`, `tree_peak_rss=3729.7MB`, `duration=16013ms`
+  - binary `lsp-ts`: `20260603T215954Z-tui-lsp-ts-run-1`, `tree_peak_cpu=717.1%`, `tree_peak_rss=3351.54MB`, `duration=9534ms`
+- comparison points:
+  - source `text` current sticky one-way upgrade: `20260603T213729Z-tui-text-run-1`, `tree_peak_cpu=296.2%`, `tree_peak_rss=2777.88MB`, `duration=73887ms`
+  - binary `text` current sticky one-way upgrade: `20260603T220716Z-tui-text-run-1`, `tree_peak_cpu=610%`, `tree_peak_rss=2648.73MB`, `duration=17069ms`
+  - binary `task-ts` current sticky one-way upgrade: `20260603T213729Z-tui-task-ts-run-1`, `tree_peak_cpu=280.3%`, `tree_peak_rss=1561.35MB`, `duration=45873ms`
+  - binary `lsp-ts` current sticky one-way upgrade: `20260603T213729Z-tui-lsp-ts-run-1`, `tree_peak_cpu=298.9%`, `tree_peak_rss=2078.44MB`, `duration=68650ms`
+- interpretation:
+  - this mostly traded back the CPU/RSS win in exchange for shorter duration
+  - the missing binary `text` case also failed: tail trimming was slightly worse than sticky on both CPU and duration there
+  - likely explanation: trimming the committed prefix and resetting markdown parse state destroyed too much incremental/block reuse in the current single-renderable design, so repeated markdown work came back
+- keep rule:
+  - revert this patch
+  - do not trim committed markdown prefixes out of the live renderable in the current implementation unless the active block is split from frozen blocks more explicitly
+
+### Rejected Stable-Block Surface Rotation
+
+- follow-up hypothesis:
+  - instead of trimming inside one live `MarkdownRenderable`, freeze committed markdown blocks into scrollback rows, destroy that live surface, and continue streaming with a fresh surface that only contains the remaining tail block
+- diagnostic patch:
+  - `packages/opencode/src/cli/cmd/run/scrollback.surface.ts`
+  - after committing stable markdown blocks, recreated the active markdown surface from the remaining unstable tail so the live surface would only carry one active block between block-boundary commits
+- why this was the intended stronger test:
+  - this matches the “frozen committed blocks + one active block” direction more closely than raw in-place prefix trimming
+  - it avoids mutating the live `MarkdownRenderable` content in place and only rotates at stable block boundaries
+- binary-first validation:
+  - binary `text`: `20260603T221605Z-tui-text-run-1`, `tree_peak_cpu=683.5%`, `tree_peak_rss=2995.15MB`, `duration=16584ms`
+  - binary `task-ts`: `20260603T221625Z-tui-task-ts-run-1`, `tree_peak_cpu=671.2%`, `tree_peak_rss=2977.77MB`, `duration=16034ms`
+  - binary `lsp-ts`: `20260603T221644Z-tui-lsp-ts-run-1`, `tree_peak_cpu=638%`, `tree_peak_rss=2781.36MB`, `duration=10770ms`
+- comparison points:
+  - sticky one-way binary `text`: `20260603T220716Z-tui-text-run-1`, `tree_peak_cpu=610%`, `tree_peak_rss=2648.73MB`, `duration=17069ms`
+  - sticky one-way binary `task-ts`: `20260603T213729Z-tui-task-ts-run-1`, `tree_peak_cpu=280.3%`, `tree_peak_rss=1561.35MB`, `duration=45873ms`
+  - sticky one-way binary `lsp-ts`: `20260603T213729Z-tui-lsp-ts-run-1`, `tree_peak_cpu=298.9%`, `tree_peak_rss=2078.44MB`, `duration=68650ms`
+  - tail-trim binary `text`: `20260603T220751Z-tui-text-run-1`, `tree_peak_cpu=639.3%`, `tree_peak_rss=2586.17MB`, `duration=17959ms`
+  - tail-trim binary `task-ts`: `20260603T215935Z-tui-task-ts-run-1`, `tree_peak_cpu=685.5%`, `tree_peak_rss=3729.7MB`, `duration=16013ms`
+  - tail-trim binary `lsp-ts`: `20260603T215954Z-tui-lsp-ts-run-1`, `tree_peak_cpu=717.1%`, `tree_peak_rss=3351.54MB`, `duration=9534ms`
+- interpretation:
+  - this improved duration sharply versus sticky one-way, but peak CPU/RSS were still far above the sticky CPU-saving path and much closer to the old CPU-hot shape
+  - compared with raw tail-trim, this rotation variant was somewhat less bad, especially on `task-ts` and `lsp-ts`, but it still failed the actual pass condition: peak CPU stayed nowhere near the sticky one-way result
+  - likely explanation: even at coarse block boundaries, destroying/recreating the active markdown surface still throws away too much render/layout continuity
+- keep rule:
+  - revert this patch
+  - do not rotate the active markdown surface at every stable-block boundary in the current implementation
+  - next work should target scheduling/visibility metrics or a true two-lane plain-text-visible path, not more single-surface reset variants
 
 ## Repro Commands
 
