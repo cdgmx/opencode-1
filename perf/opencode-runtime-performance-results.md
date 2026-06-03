@@ -278,6 +278,14 @@ These ideas were tested already. They did not materially lower top-line CPU, or 
 - Source-runner CPU profile for the minimal TUI case:
   - artifact: `20260603T171721Z-tui-text-run-1/cpu-profile/CPU.101102111541.42674.md`
   - profile is source-biased: hot samples are mostly Bun/source transpilation, native frames, and OpenTUI shutdown cleanup. Do not use it as binary runtime proof.
+- Source-runner heap snapshot for minimal TUI:
+  - artifact: `20260603T172116Z-tui-text-run-1`
+  - snapshots: `heaps/1-boot-01.heapsnapshot`, `heaps/1-idle-01.heapsnapshot`, etc.
+  - boot after GC: `rss=434.32MB`, `heapUsed=123.59MB`, `external=66.29MB`, `arrayBuffers=16.78MB`
+  - idle after GC: `rss=984.83MB`, `heapUsed=120.23MB`, `external=52.76MB`, `arrayBuffers=16.78MB`
+  - snapshotting inflated RSS, so use the memory composition, not the top-line RSS, from this run.
+  - top heap classes at boot: `FunctionCodeBlock` `19.08MB`, `ArrayBuffer` `16.00MB`, `ModuleRecord` `13.03MB`, `JSLexicalEnvironment` `7.53MB`, closures `5.81MB`.
+  - interpretation: the fixed floor is mostly module/code/runtime/native residency, not a large retained transcript object graph.
 
 ### Revised Hypothesis
 
