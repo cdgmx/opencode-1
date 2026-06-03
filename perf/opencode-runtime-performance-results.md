@@ -1,141 +1,279 @@
 # OpenCode Runtime Performance Results
 
-HTML comparison report: `perf/opencode-runtime-performance-report.html`.
+## Current Harness Note
 
-Regenerate after new runs:
+The active harness has been simplified into a quick black-box CPU/RAM runner in `packages/opencode/script/perf-run.ts`.
+
+Current default use:
+
+- `cd packages/opencode`
+- `bun run perf:run`
+
+The detailed experiments below are historical results from the earlier, larger harness.
+
+HTML report: `perf/opencode-runtime-performance-report.html`
+
+## Current Answer
+
+- Hottest project-owned function: `RunScrollbackStream.writeStreaming`
+  - `packages/opencode/src/cli/cmd/run/scrollback.surface.ts`
+- Rich-mode downstream hotspot chain:
+  - `updateBlocks`
+  - `parseMarkdownIncremental`
+  - `updateLayout`
+- Plain-mode downstream hotspot chain:
+  - `textBufferSetStyledText`
+  - `renderSurface`
+- Real-workspace amplifier:
+  - snapshot-driven `git add --all` churn
+
+## Brutal Summary
+
+- We did **not** solve the CPU problem.
+- Lowering FPS reduced CPU a bit. Not enough.
+- Event-driven mode was not a real fix.
+- Plain-stream mode was not a real fix.
+- Final-render mode was not a real fix.
+- Snapshot deferral removed git noise. Main OpenCode CPU stayed high.
+- Wrong assumption: markdown parsing alone is the problem.
+- Better answer: the whole retained streaming write/render path is the problem.
+- Attempted code bypass for assistant/reasoning per-chunk flush was not a real fix.
+
+## Final Conclusions
+
+1. The root problem is the retained streaming scrollback write/render path.
+2. Turning markdown off is not enough; cost shifts into plain text rendering.
+3. Snapshot deferral removes git churn, but core OpenCode CPU remains high.
+4. Most tested knobs only moved work around or shaved off an insignificant amount.
+5. Bypassing assistant/reasoning per-chunk flush reduced `writeStreaming`, but still did not materially lower peak CPU.
+6. Next step is still open; the remaining cost looks more like final rich render / surrounding runtime work than the per-chunk `writeStreaming` path.
+
+## Key Artifacts
+
+- Markdown Bun profile:
+  - `packages/opencode/.artifacts/perf/20260603T015837Z-tui-delta-burst-markdown-run-1/cpu-profile-1/CPU.45974791271.58161.md`
+- Text Bun profile:
+  - `packages/opencode/.artifacts/perf/20260603T020003Z-tui-delta-burst-text-run-1/cpu-profile-1/CPU.46061978127.60276.md`
+- Stream switch matrix:
+  - rich: `20260603T021518Z-tui-delta-burst-markdown-run-1`
+  - plain: `20260603T021543Z-tui-delta-burst-markdown-run-1`
+  - final: `20260603T021609Z-tui-delta-burst-markdown-run-1`
+- Failed code-change check:
+  - perf run: `20260603T023358Z-tui-delta-burst-markdown-run-1`
+  - CPU profile: `20260603T023436Z-tui-delta-burst-markdown-run-1/cpu-profile-1/CPU.48132789159.98732.md`
+
+## Experiment Log
+
+### H1: Shared-home DB contention is the main lag source
+
+- Test: 6-instance isolated vs shared-home real-workspace runs
+- Artifacts:
+  - isolated: `20260602T160141Z-multi-instance-slow-stream-run-1`
+  - shared: `20260602T160421Z-multi-instance-slow-stream-run-1`
+- Result:
+  - shared-home failed early with duplicate-index / lock issues
+  - isolated run still showed high CPU/process fan-out
+- Conclusion: failed as the main explanation
+
+### H2: Interactive TUI is more expensive than non-TUI for the same stream
+
+- Test: mocked 2000-chunk stream, `run-json` vs `tui`
+- Artifacts:
+  - `20260603T005621Z-run-json-delta-burst-markdown-run-1`
+  - `20260603T005623Z-tui-delta-burst-text-run-1`
+  - `20260603T005627Z-tui-delta-burst-markdown-run-1`
+  - `20260603T005631Z-tui-delta-burst-code-run-1`
+- Result:
+  - `run-json`: `2.035s`, `124.6%`, `460.3MB`
+  - `tui text`: `4.027s`, `222.8%`, `890.13MB`
+  - `tui markdown`: `4.025s`, `242.8%`, `903.25MB`
+  - `tui code`: `3.928s`, `224.1%`, `903.31MB`
+- Conclusion: interactive renderer path is a dominant cost center
+
+### H3: Snapshotting is a major real-workspace amplifier
+
+- Test: same 3-instance workspace run, snapshot on vs off
+- Artifacts:
+  - on: `20260603T010348Z-multi-instance-slow-stream-run-1`
+  - off: `20260603T010710Z-multi-instance-slow-stream-run-1`
+- Result:
+  - on: `24` child processes, `9` git children, `91.3%` peak git CPU
+  - off: `6` child processes, `0` git children
+- Conclusion: real amplifier, not the main CPU problem
+
+### H4: Lower FPS / event-driven mode will fix the problem
+
+- Test: reduced loop, event mode, harsher low-FPS loop
+- Key artifacts:
+  - reduced loop: `20260603T011413Z-tui-delta-burst-markdown-run-1`
+  - event: `20260603T012656Z-tui-delta-burst-markdown-run-1`
+  - low-FPS: `20260603T012831Z-tui-delta-burst-markdown-run-1`
+- Result:
+  - helps somewhat
+  - not transformative
+- Conclusion: failed as a real fix
+
+### H5: Chunk frequency, not total text volume, is the main cause
+
+- Test: keep total volume ~8000 chars, vary chunk count/size
+- Artifacts:
+  - text: `20260603T012018Z`, `20260603T012023Z`, `20260603T012027Z`
+  - markdown: `20260603T012031Z`, `20260603T012036Z`, `20260603T012040Z`
+- Result:
+  - text: coarser chunks did not lower peak CPU
+  - markdown: coarser chunks lowered CPU/RSS somewhat
+- Conclusion: partly true, still wrong as the full explanation
+
+### H6: Bun-native profiles can identify the hottest internal function
+
+- Decision:
+  - removed custom perf counters
+  - switched to Bun-native CPU profiles only
+- Harness support:
+  - `--bun-cpu-prof true`
+  - clean exit via `OPENCODE_PERF_AUTO_CLOSE=1`
+- Conclusion: function-level attribution is reliable enough to guide fixes
+
+### H7: Markdown path is the hottest internal stack
+
+- Test: long Bun-profiled markdown run
+- Artifact:
+  - `20260603T015837Z-tui-delta-burst-markdown-run-1/cpu-profile-1/CPU.45974791271.58161.md`
+- Result:
+  - `async writeStreaming`: `21.3%` / `5.36s`
+  - `updateBlocks`: `13.2%` / `3.34s`
+  - `parseMarkdownIncremental`: `12.1%` / `3.07s`
+  - `updateLayout`: `10.1%` / `2.54s`
+  - `toLLMEvents`: `4.9%` / `1.24s`
+- Conclusion: confirmed hot path, not a fix
+
+### H8: Plain text should be cheap once markdown is removed
+
+- Test: long Bun-profiled text run
+- Artifact:
+  - `20260603T020003Z-tui-delta-burst-text-run-1/cpu-profile-1/CPU.46061978127.60276.md`
+- Result:
+  - `async writeStreaming`: `25.9%` / `6.84s`
+  - `updateBlocks`: `24.2%` / `6.40s`
+  - `parseMarkdownIncremental`: `24.1%` / `6.36s`
+- Conclusion: assumption was wrong; plain text is still expensive here
+
+### H9: Stream-path switches should materially lower CPU
+
+- Added switches:
+  - `--run-stream-render-mode rich|plain|final`
+  - `--run-stream-settle-mode eager|throttled|final`
+- Artifacts:
+  - rich: `20260603T021518Z-tui-delta-burst-markdown-run-1`
+  - plain: `20260603T021543Z-tui-delta-burst-markdown-run-1`
+  - final: `20260603T021609Z-tui-delta-burst-markdown-run-1`
+
+#### H9a: `plain` mode materially lowers CPU
+
+- Result:
+  - peak CPU: `206.1%` rich vs `217.0%` plain
+  - hotspot changed from markdown chain to text-buffer chain
+- Conclusion: failed; cost moved into low-level text drawing instead of disappearing
+
+#### H9b: `final` mode materially lowers CPU
+
+- Result:
+  - peak CPU: `206.1%` rich vs `205.4%` final
+  - `writeStreaming` dropped from `22.2% / 5.61s` to `16.5% / 4.30s`
+  - markdown/update/layout still stayed heavy
+- Conclusion: failed at the top-line CPU level; one function improved, total CPU did not
+
+### H10: Code bypass of assistant/reasoning per-chunk flush will materially lower CPU
+
+- Change tested:
+  - skip `flushActive(false, false)` in `RunScrollbackStream.writeStreaming` for non-tool commits unless `shouldSettle(..., false)` says to render
+- Artifacts:
+  - perf run: `20260603T023358Z-tui-delta-burst-markdown-run-1`
+  - CPU profile: `20260603T023436Z-tui-delta-burst-markdown-run-1/cpu-profile-1/CPU.48132789159.98732.md`
+- Result:
+  - targeted hotspot improved: `async writeStreaming` dropped to noise level in the patched CPU profile
+  - top-line CPU did not materially improve: patched run still hit `189.8%` child peak CPU
+- Conclusion: failed as a meaningful fix; per-chunk `writeStreaming` was real cost, but not enough of total cost to solve the problem
+
+### H11: Coarser retained streaming settle cadence will materially lower CPU
+
+- Hypothesis:
+  - fewer retained-stream settle/layout/render passes will reduce real runtime CPU
+- Change:
+  - `STREAM_SETTLE_INTERVAL_MS`: `75 -> 150`
+  - `STREAM_SETTLE_MIN_CHARS`: `256 -> 1024`
+- Result:
+  - markdown artifacts: `20260603T025553Z-tui-delta-burst-markdown-run-{1,2,3}`
+  - text artifacts: `20260603T025721Z-tui-delta-burst-text-run-{1,2,3}`
+  - markdown `child_max_cpu` runs: `170.8`, `184.7`, `201.0`; median `184.7` vs current representative `189.8` = `5.1` points better
+  - text `child_max_cpu` runs: `177.2`, `199.8`, `190.8`; median `190.8`
+  - profile rerun skipped because markdown result missed the keep threshold and triggered rollback rules
+- Conclusion:
+  - revert; markdown improvement was below the 10-point rollback floor and far below the 20-point keep threshold
+
+### H12: Pre-gate markdown/code updates and text render deferral will materially lower CPU
+
+- Change:
+  - moved markdown/code `renderable.content` and `renderable.streaming` updates behind `shouldSettle(...)`
+  - moved text `active.surface.render()` behind the row-commit precheck
+- Artifacts:
+  - markdown: `20260603T030456Z-tui-delta-burst-markdown-run-{1,2,3}`
+  - text: `20260603T030626Z-tui-delta-burst-text-run-{1,2,3}`
+- Result:
+  - markdown `child_max_cpu` runs: `195.7`, `199.7`, `193.3`; median `195.7` vs baseline `189.8` = `5.9` points worse
+  - text `child_max_cpu` runs: `199.0`, `199.6`, `202.1`; median `199.6` vs latest logged text median `190.8` = `8.8` points worse (`4.6%`)
+  - profile rerun skipped because markdown regressed and failed the rollback floor immediately
+- Conclusion:
+  - revert; markdown regressed versus baseline, so this packet did not materially lower CPU
+
+### H13: Batch adjacent text-delta publishes in the session processor
+
+- Change:
+  - batched adjacent `text-delta` publishes in `packages/opencode/src/session/processor.ts` with a `256`-character cap
+  - flushed before non-`text-delta` boundaries and terminal cleanup to preserve ordered output and final delivery
+- Artifacts:
+  - markdown: `20260603T032137Z-tui-delta-burst-markdown-run-{1,2,3}`
+  - text: `20260603T032302Z-tui-delta-burst-text-run-{1,2,3}`
+- Result:
+  - markdown `child_max_cpu` runs: `200.3`, `187.2`, `170.8`; median `187.2` vs baseline `189.8` = `2.6` points better
+  - text `child_max_cpu` runs: `193.3`, `196.3`, `187.8`; median `193.3` vs latest logged text median `190.8` = `2.5` points worse (`1.3%`)
+  - profile rerun skipped because markdown improvement missed both the `10`-point rollback floor and the final `15`-point keep bar
+  - quick smoke review found no ordered-stream or final-flush bug in code, but the raw TUI artifact still looked chunkier under the `256`-character cap
+- Conclusion:
+  - revert and stop; markdown improvement was not material, so this final bounded packet does not justify keeping the change
+
+## Best Current Summary
+
+- Confirmed hottest function:
+  - `RunScrollbackStream.writeStreaming`
+  - `packages/opencode/src/cli/cmd/run/scrollback.surface.ts`
+- Confirmed hottest downstream work:
+  - rich mode: `updateBlocks`, `parseMarkdownIncremental`, `updateLayout`
+  - plain mode: `textBufferSetStyledText`, `renderSurface`
+- Meaning:
+  - the root cause is broader than markdown parsing
+  - the retained streaming write/render path itself is too expensive
+  - turning markdown off only shifts the cost into plain text rendering
+  - most tested switches changed where CPU burns, not how much burns
+  - even a direct code bypass that cools `writeStreaming` did not solve top-line CPU
+
+## Repro Commands
 
 ```sh
 cd packages/opencode
-bun run perf:report .artifacts/perf/20260602T160141Z-multi-instance-slow-stream-run-1 .artifacts/perf/20260602T160421Z-multi-instance-slow-stream-run-1
+
+# Function-level markdown profile
+bun run perf:run --mode tui --scenario delta-burst-markdown --chunks 2000 --chunk-size 4 --delay-ms 10 --runs 1 --bun-cpu-prof true
+
+# Function-level text profile
+bun run perf:run --mode tui --scenario delta-burst-text --chunks 2000 --chunk-size 4 --delay-ms 10 --runs 1 --bun-cpu-prof true
+
+# Stream switch proof matrix
+bun run perf:run --mode tui --scenario delta-burst-markdown --chunks 2000 --chunk-size 4 --delay-ms 10 --runs 1 --bun-cpu-prof true --run-stream-render-mode rich --run-stream-settle-mode throttled
+bun run perf:run --mode tui --scenario delta-burst-markdown --chunks 2000 --chunk-size 4 --delay-ms 10 --runs 1 --bun-cpu-prof true --run-stream-render-mode plain --run-stream-settle-mode eager
+bun run perf:run --mode tui --scenario delta-burst-markdown --chunks 2000 --chunk-size 4 --delay-ms 10 --runs 1 --bun-cpu-prof true --run-stream-render-mode final --run-stream-settle-mode final
+
+# Snapshot amplifier check
+bun run perf:run --mode multi-instance --scenario slow-stream --chunks 500 --chunk-size 8 --delay-ms 40 --instances 3 --runs 1 --timeout-ms 90000 --settle-ms 500 --workspace /Users/christian/Documents/Github/opencode-dev --enable-project-config
+bun run perf:run --mode multi-instance --scenario slow-stream --chunks 500 --chunk-size 8 --delay-ms 40 --instances 3 --runs 1 --timeout-ms 90000 --settle-ms 500 --workspace /Users/christian/Documents/Github/opencode-dev --enable-project-config --enable-snapshot false
 ```
-
-## 2026-06-02: 6-Instance Real-Workspace Repro
-
-Goal: determine whether 5-10 concurrent OpenCode instances show CPU pressure, memory pressure, or shared-home database contention when using mocked LLM streams.
-
-Commands were run from `packages/opencode` against workspace `/Users/christian/Documents/Github/opencode-dev` with project config and LSP enabled.
-
-### Isolated Homes
-
-Artifact: `packages/opencode/.artifacts/perf/20260602T160141Z-multi-instance-slow-stream-run-1`
-
-Command:
-
-```sh
-bun run perf:run --mode multi-instance --scenario slow-stream --chunks 1200 --chunk-size 8 --delay-ms 100 --instances 6 --runs 1 --timeout-ms 180000 --settle-ms 1000 --workspace /Users/christian/Documents/Github/opencode-dev --enable-project-config --enable-lsp
-```
-
-Result:
-
-| Metric | Value |
-| --- | ---: |
-| Duration | `147.604s` |
-| Exit codes | `[143, 143, 143, 143, 143, 143]` |
-| Unique child processes | `94` |
-| OpenCode child count | `6` |
-| Git child count | `41` |
-| Peak OpenCode RSS | `486.08MB` |
-| Peak OpenCode CPU | `137%` |
-| Peak git CPU | `130.6%` |
-| LSP count | `0` |
-
-Interpretation: isolated concurrent instances completed until harness termination and showed real CPU/process fan-out, especially from OpenCode and git children. This supports CPU/process pressure as one contributor, but does not prove memory is the primary lag cause.
-
-### Shared Home
-
-Artifact: `packages/opencode/.artifacts/perf/20260602T160421Z-multi-instance-slow-stream-run-1`
-
-Command:
-
-```sh
-bun run perf:run --mode multi-instance --scenario slow-stream --chunks 1200 --chunk-size 8 --delay-ms 100 --instances 6 --runs 1 --timeout-ms 180000 --settle-ms 1000 --workspace /Users/christian/Documents/Github/opencode-dev --enable-project-config --enable-lsp --shared-home
-```
-
-Result:
-
-| Metric | Value |
-| --- | ---: |
-| Duration | `180.018s` |
-| Exit codes | `[1, 1, 1, 1, 1, 143]` |
-| Unique child processes | `15` |
-| OpenCode child count | `6` |
-| Git child count | `6` |
-| Peak OpenCode RSS | `1007.19MB` |
-| Peak OpenCode CPU | `187.2%` |
-| Peak git CPU | `156.7%` |
-| LSP count | `0` |
-
-Observed stdout error:
-
-```text
-index message_session_time_created_id_idx already exists
-```
-
-Interpretation: shared-home concurrent startup can race database migration/index creation. This is stronger evidence for shared SQLite/global home contention than for memory as the primary lag cause, because 5 of 6 instances failed before a clean steady-state workload could be measured.
-
-## Current Conclusion
-
-- CPU/process pressure: supported by 6-instance isolated run.
-- Memory pressure: supported at host level during retest, but not fully attributable to OpenCode because baseline host pressure was already high before the workload warmed up.
-- Database contention: strongly supported; shared-home runs have reproduced both `database is locked` and duplicate-index migration failures.
-- LSP pressure: not proven; `--enable-lsp` currently still reports `lsp: 0`, so the harness needs stronger LSP triggering.
-
-## Next Verification Step
-
-Capture a quiet-machine baseline, then rerun 6-10 instance isolated homes to separate pre-existing macOS memory pressure from OpenCode-induced pressure.
-
-## 2026-06-02: Host Memory Sampling Retest
-
-Change: perf harness now writes `host.jsonl` with macOS `vm_stat`, `vm.swapusage`, and load average samples, and `summary.json` includes tracked total RSS plus host memory/swap/load peaks.
-
-### Isolated Homes With Host Samples
-
-Artifact: `packages/opencode/.artifacts/perf/20260602T161634Z-multi-instance-slow-stream-run-1`
-
-Result:
-
-| Metric | Value |
-| --- | ---: |
-| Duration | `153.337s` |
-| Exit codes | `[143, 143, 143, 143, 143, 143]` |
-| Unique child processes | `84` |
-| OpenCode child count | `6` |
-| Git child count | `43` |
-| Peak tracked total RSS | `2331.8MB` |
-| Peak OpenCode RSS | `468.06MB` |
-| Peak OpenCode CPU | `130.3%` |
-| Host peak memory used | `99.86%` / `16361.84MB` |
-| Host peak swap used | `9918.19MB` |
-| Host peak 1m load avg | `26.98` |
-| LSP count | `0` |
-
-Host baseline note: first host sample was already `97.9%` memory used with `7617MB` swap, so this proves the run occurred under memory pressure but does not by itself prove OpenCode caused all of it.
-
-### Shared Home With Host Samples
-
-Artifact: `packages/opencode/.artifacts/perf/20260602T161916Z-multi-instance-slow-stream-run-1`
-
-Result:
-
-| Metric | Value |
-| --- | ---: |
-| Duration | `180.036s` |
-| Exit codes | `[1, 143, 1, 1, 1, 1]` |
-| Unique child processes | `13` |
-| OpenCode child count | `6` |
-| Git child count | `5` |
-| Peak tracked total RSS | `1842.47MB` |
-| Peak OpenCode RSS | `877.75MB` |
-| Peak OpenCode CPU | `189.3%` |
-| Host peak memory used | `99.71%` / `16336.81MB` |
-| Host peak swap used | `8542.19MB` |
-| Host peak 1m load avg | `11.78` |
-| LSP count | `0` |
-
-Observed stdout error:
-
-```text
-database is locked
-```
-
-Interpretation: shared-home still fails before a clean steady-state workload. This keeps database contention as the strongest shared-home finding. Memory pressure is real on the host, but the shared-home run remains invalid for isolating memory as the primary lag cause.

@@ -1,5 +1,18 @@
 # OpenCode Runtime Performance Plan
 
+## Current Harness
+
+The active harness is now the reduced black-box runner in `packages/opencode/script/perf-run.ts`.
+
+Current goal:
+
+- finish in seconds, not minutes
+- print CPU/RAM results immediately
+- avoid runtime-specific tuning flags
+- keep the measurement stable enough for before/after code-change checks
+
+The rest of this document is historical design context from the earlier deeper investigation.
+
 ## Goal
 
 Confirm whether streamed `message.part.delta` volume causes OpenCode CPU/RAM pressure, isolate whether the hot path is session/event churn or TUI render churn, and create repeatable local benchmarks for side-by-side fix testing without calling real LLM endpoints.
@@ -53,6 +66,8 @@ Confirm whether streamed `message.part.delta` volume causes OpenCode CPU/RAM pre
 | `delta-burst-code` | Many tiny code chunks; code render stress. |
 | `reasoning-burst` | Thinking stream pressure before final answer. |
 | `tool-loop` | Tool-call round-trip pressure. |
+| `parallel-tool-loop` | One assistant turn emits several bash tool calls to stress parallel tool orchestration. |
+| `subagent-chain` | Parent session calls `task`, subagent calls `bash`, then both sessions resume. |
 | `slow-stream` | Long steady stream at fixed tokens/sec. |
 | `multi-instance` | Several OpenCode processes plus child processes. |
 
@@ -62,12 +77,16 @@ Confirm whether streamed `message.part.delta` volume causes OpenCode CPU/RAM pre
 - `max_cpu`, `avg_cpu`
 - `max_rss_mb`, `avg_rss_mb`
 - `child_max_cpu`, `child_max_rss_mb`
+- `child_kind_max_cpu`, `child_kind_max_rss_mb`
+- `tracked_child_kind_max_total_cpu`, `tracked_child_kind_max_total_rss_mb`
 - `llm_requests`
 - `delta_chunks`
 - `chunks_per_second`
 - `stdout_events`
 - `stderr_bytes`
 - `exit_code`
+- `host_max_memory_used_mb_delta`, `host_max_memory_used_percent_delta`
+- `host_max_swap_used_mb_delta`, `host_max_load_avg_1m_delta`
 
 ## Artifact Shape
 
@@ -138,7 +157,7 @@ Likely missing pressure sources:
 Next real-repro benchmark additions:
 
 1. Done: Add `--enable-lsp` / `--enable-project-config` switches so the harness can compare isolated mode against real workspace services.
-2. Partial: `tool-loop` now performs a real bash tool-call round trip before final text; subagent-specific pressure is still pending.
+2. Done: `tool-loop` performs a real bash tool-call round trip, `parallel-tool-loop` emits several bash calls in one turn, and `subagent-chain` adds one real nested `task` -> subagent -> bash flow.
 3. Done: Extend `multi-instance` to run slow streams across multiple process trees and report aggregate child CPU/RSS.
 4. Done: Track process counts by role in `summary.json` so lag can be tied to OpenCode children, LSP servers, shells, git, or watcher helpers.
 5. Done: Run slow-stream variants with `--delay-ms` to hold multiple instances open long enough to match the real failure mode.
@@ -149,6 +168,7 @@ New harness switches:
 - `--enable-project-config`: allow workspace `opencode.json` / instructions discovery.
 - `--enable-lsp`: set config `lsp: true` instead of disabling LSP.
 - `--enable-plugins`: allow plugin discovery instead of `OPENCODE_PURE=1`.
+- `--enable-snapshot <true|false>`: keep snapshot git staging on or disable it to isolate repo-git pressure.
 - `--enable-autocompact`: allow autocompact background behavior.
 - `--enable-models-fetch`: allow model fetch background behavior.
 - `--shared-home`: make all multi-instance processes share one test home; useful for reproducing DB lock contention, but not for clean aggregate CPU/RSS runs.
@@ -166,6 +186,12 @@ bun run perf:run --mode multi-instance --scenario slow-stream --chunks 20 --chun
 
 # Tool-call round trip without real provider calls.
 bun run perf:run --mode run-json --scenario tool-loop --chunks 20 --chunk-size 4 --runs 1 --timeout-ms 30000
+
+# Parallel tool-call burst inside one assistant turn.
+bun run perf:run --mode run-json --scenario parallel-tool-loop --tool-calls 4 --runs 1 --timeout-ms 30000
+
+# Nested task -> subagent -> bash chain without real provider calls.
+bun run perf:run --mode run-json --scenario subagent-chain --runs 1 --timeout-ms 30000
 ```
 
 Observed real-world smoke results:
@@ -180,8 +206,8 @@ Observed real-world smoke results:
 Next real-world repro step:
 
 - Investigate shared-home startup migration concurrency first, because it can crash 5 of 6 simultaneous instances before measuring steady-state lag.
-- Add a true `subagent-chain` scenario after migration contention is isolated, so process pressure can be tested with nested session/tool orchestration.
 - Strengthen LSP triggering in the harness; current `--enable-lsp` runs still report `lsp: 0`.
+- Use Bun-native CPU profiling for per-function attribution instead of the removed custom perf-counter path.
 
 ## Interpretation
 
