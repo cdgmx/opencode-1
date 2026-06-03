@@ -4,16 +4,19 @@ import path from "node:path"
 import { testProviderConfig } from "../test/lib/test-provider"
 
 type Mode = "run-json" | "tui"
-type Scenario = "text" | "markdown" | "code" | "read-ts" | "lsp-ts"
+type Scenario = "text" | "markdown" | "code" | "read-ts" | "lsp-ts" | "task-ts"
 type Runner = "source" | "binary"
 
 type Args = {
   mode: Mode
   scenario: Scenario
   runner: Runner
+  smol: boolean
+  cpuProfile: boolean
   workspace?: string
   title?: string
   attach: boolean
+  warmHome: boolean
   runs: number
   chunks: number
   chunkSize: number
@@ -24,6 +27,12 @@ type Args = {
   instances: number
   enableLsp: boolean
   disableLspDownload: boolean
+  memoryCheckpoints: boolean
+  memoryInstances: number
+  memoryCheckpointNames: string
+  heapSnapshots: boolean
+  heapInstances: number
+  heapCheckpoints: string
 }
 
 type ProcessKind = "wrapper" | "opencode" | "shell" | "git" | "lsp" | "watcher" | "npm" | "other"
@@ -43,7 +52,9 @@ type Summary = {
   scenario: Scenario
   mode: Mode
   runner: Runner
+  smol: boolean
   attach: boolean
+  warm_home: boolean
   target: string
   duration_ms: number
   peak_cpu: number
@@ -91,14 +102,25 @@ async function runOnce(args: Args, artifactName: string) {
   const homes = await Promise.all(Array.from({ length: args.instances }, () => mkdtemp(path.join(tmpdir(), "opencode-perf-"))))
   const serverHome = args.attach ? await mkdtemp(path.join(tmpdir(), "opencode-perf-server-")) : undefined
   const workspace =
-    args.workspace ? path.resolve(args.workspace) : args.scenario === "read-ts" || args.scenario === "lsp-ts" ? opencodeRoot : homes[0]!
+    args.workspace ? path.resolve(args.workspace) : needsRepoWorkspace(args.scenario) ? opencodeRoot : homes[0]!
   const llm = createPerfServer(args, workspace)
+  if (args.warmHome) {
+    await warmHomes(args, [...homes, ...(serverHome ? [serverHome] : [])], `http://127.0.0.1:${llm.port}`)
+  }
   const opencodeServer = serverHome ? await startOpencodeServer(args, serverHome, `http://127.0.0.1:${llm.port}`) : undefined
   await mkdir(artifactDir, { recursive: true })
 
   try {
-    const procs = homes.map((home) =>
-      spawnOpencode(args, isolatedEnv(args, home, `http://127.0.0.1:${llm.port}`), workspace, opencodeServer?.url),
+    const procs = homes.map((home, index) =>
+      spawnOpencode(
+        args,
+        isolatedEnv(args, home, `http://127.0.0.1:${llm.port}`, {
+          artifactDir,
+          index,
+        }),
+        workspace,
+        opencodeServer?.url,
+      ),
     )
     const start = performance.now()
     const stdout = procs.map((proc) => readStream(proc.stdout))
@@ -152,6 +174,24 @@ async function runOnce(args: Args, artifactName: string) {
     await llm.stop(true)
     await Promise.all([...homes, ...(serverHome ? [serverHome] : [])].map((home) => rm(home, { recursive: true, force: true })))
   }
+}
+
+async function warmHomes(args: Args, homes: string[], llmUrl: string) {
+  await Promise.all(
+    homes.map(async (home) => {
+      const proc = Bun.spawn(opencodeCommand({ ...args, cpuProfile: false }, ["db", "path"]), {
+        cwd: opencodeRoot,
+        env: { ...Bun.env, ...isolatedEnv(args, home, llmUrl) },
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      })
+      const exitCode = await proc.exited
+      if (exitCode !== 0) {
+        throw new Error(`home warmup failed with exit code ${exitCode}`)
+      }
+    }),
+  )
 }
 
 type OpencodeServer = {
@@ -222,7 +262,15 @@ function spawnOpencode(args: Args, env: Record<string, string>, workspace: strin
 
 function opencodeCommand(args: Args, commandArgs: string[]) {
   if (args.runner === "binary") return [binaryEntry, ...commandArgs]
-  return ["bun", "run", "--conditions=browser", cliEntry, ...commandArgs]
+  return [
+    "bun",
+    ...(args.smol ? ["--smol"] : []),
+    ...(args.cpuProfile ? ["--cpu-prof", "--cpu-prof-md"] : []),
+    "run",
+    "--conditions=browser",
+    cliEntry,
+    ...commandArgs,
+  ]
 }
 
 function wrapTtyIfNeeded(mode: Mode, command: string[]) {
@@ -235,7 +283,7 @@ function wrapTtyIfNeeded(mode: Mode, command: string[]) {
 function stopInteractiveWhenSettled(args: Args, procs: Array<ReturnType<typeof Bun.spawn>>, server: PerfServer) {
   if (args.mode === "run-json") return
   const expectedCompletions =
-    procs.length * ((args.scenario === "read-ts" || args.scenario === "lsp-ts" ? 2 : 1) + (args.title === undefined ? 1 : 0))
+    procs.length * ((needsToolTurn(args.scenario) ? 2 : 1) + (args.title === undefined ? 1 : 0))
   let settled: ReturnType<typeof setTimeout> | undefined
   const timer = setInterval(() => {
     if (server.completeCount < expectedCompletions || settled) return
@@ -271,14 +319,15 @@ function createPerfServer(args: Args, workspace: string) {
     hostname: "127.0.0.1",
     async fetch(request) {
       const url = new URL(request.url)
-      if (!url.pathname.endsWith("/chat/completions")) {
+      const mode = requestMode(url.pathname)
+      if (!mode) {
         return Response.json({ error: "not found" }, { status: 404 })
       }
 
       const body = (await request.json().catch(() => undefined)) as Record<string, unknown> | undefined
       requestCount++
 
-      return new Response(streamResponse(args, workspace, body, () => completeCount++), {
+      return new Response(streamResponse(args, workspace, body, mode, () => completeCount++), {
         headers: {
           "content-type": "text/event-stream",
           "cache-control": "no-cache",
@@ -301,15 +350,21 @@ function hasToolResult(body: Record<string, unknown> | undefined) {
   return JSON.stringify(body?.messages ?? body ?? "").includes('"role":"tool"')
 }
 
-function streamResponse(args: Args, workspace: string, body: Record<string, unknown> | undefined, onComplete: () => void) {
+function streamResponse(
+  args: Args,
+  workspace: string,
+  body: Record<string, unknown> | undefined,
+  mode: "chat" | "responses",
+  onComplete: () => void,
+) {
   const encoder = new TextEncoder()
   const chunks = isTitleRequest(body)
     ? [{ content: "Perf title" }]
-    : (args.scenario === "read-ts" || args.scenario === "lsp-ts") && !hasToolResult(body)
+    : needsToolTurn(args.scenario) && !hasToolResult(body)
       ? toolScenarioDeltas(args.scenario, workspace)
       : scenarioDeltas(args)
   const finishReason =
-    (args.scenario === "read-ts" || args.scenario === "lsp-ts") && !isTitleRequest(body) && !hasToolResult(body)
+    needsToolTurn(args.scenario) && !isTitleRequest(body) && !hasToolResult(body)
       ? "tool_calls"
       : "stop"
 
@@ -320,11 +375,10 @@ function streamResponse(args: Args, workspace: string, body: Record<string, unkn
         if (args.delayMs > 0) await Bun.sleep(args.delayMs)
       }
 
-      await write(chunk({ role: "assistant" }))
-      for (const delta of chunks) {
-        await write(chunk(delta))
+      const lines = mode === "responses" ? responseLines(chunks, finishReason, responseModel(body)) : chatLines(chunks, finishReason)
+      for (const line of lines) {
+        await write(line)
       }
-      await write(finishChunk(finishReason))
       controller.enqueue(encoder.encode("data: [DONE]\n\n"))
       onComplete()
       controller.close()
@@ -332,11 +386,191 @@ function streamResponse(args: Args, workspace: string, body: Record<string, unkn
   })
 }
 
+function requestMode(pathname: string) {
+  if (pathname.endsWith("/chat/completions")) return "chat" as const
+  if (pathname.endsWith("/responses")) return "responses" as const
+  return undefined
+}
+
+function responseModel(body: Record<string, unknown> | undefined) {
+  return typeof body?.model === "string" ? body.model : "test-model"
+}
+
+function chatLines(chunks: Array<Record<string, unknown>>, finishReason: string) {
+  return [chunk({ role: "assistant" }), ...chunks.map((delta) => chunk(delta)), finishChunk(finishReason)]
+}
+
+function responseLines(chunks: Array<Record<string, unknown>>, finishReason: string, model: string) {
+  const lines: unknown[] = [
+    {
+      type: "response.created",
+      sequence_number: 1,
+      response: {
+        id: "resp_perf",
+        created_at: Math.floor(Date.now() / 1000),
+        model,
+        service_tier: null,
+      },
+    },
+  ]
+  let sequence = 1
+  let messageStarted = false
+  let messageID = "msg_perf"
+  let call:
+    | {
+        id: string
+        item: string
+        name: string
+        arguments: string
+      }
+    | undefined
+
+  for (const delta of chunks) {
+    if (typeof delta.content === "string") {
+      if (!messageStarted) {
+        messageStarted = true
+        sequence += 1
+        lines.push({
+          type: "response.output_item.added",
+          sequence_number: sequence,
+          output_index: 0,
+          item: { type: "message", id: messageID },
+        })
+      }
+      sequence += 1
+      lines.push({
+        type: "response.output_text.delta",
+        sequence_number: sequence,
+        item_id: messageID,
+        delta: delta.content,
+        logprobs: null,
+      })
+    }
+
+    if (!Array.isArray(delta.tool_calls)) {
+      continue
+    }
+
+    for (const tool of delta.tool_calls) {
+      if (!tool || typeof tool !== "object") {
+        continue
+      }
+
+      const toolCall = tool as {
+        id?: string
+        function?: {
+          name?: string
+          arguments?: string
+        }
+      }
+
+      if (toolCall.id && toolCall.function?.name) {
+        call = {
+          id: toolCall.id,
+          item: "fc_perf",
+          name: toolCall.function.name,
+          arguments: "",
+        }
+        sequence += 1
+        lines.push({
+          type: "response.output_item.added",
+          sequence_number: sequence,
+          output_index: 0,
+          item: {
+            type: "function_call",
+            id: call.item,
+            call_id: call.id,
+            name: call.name,
+            arguments: "",
+            status: "in_progress",
+          },
+        })
+      }
+
+      if (!call || !toolCall.function?.arguments) {
+        continue
+      }
+
+      call.arguments += toolCall.function.arguments
+      sequence += 1
+      lines.push({
+        type: "response.function_call_arguments.delta",
+        sequence_number: sequence,
+        output_index: 0,
+        item_id: call.item,
+        delta: toolCall.function.arguments,
+      })
+    }
+  }
+
+  if (messageStarted) {
+    sequence += 1
+    lines.push({
+      type: "response.output_item.done",
+      sequence_number: sequence,
+      output_index: 0,
+      item: { type: "message", id: messageID },
+    })
+  }
+
+  if (call && finishReason === "tool_calls") {
+    sequence += 1
+    lines.push({
+      type: "response.function_call_arguments.done",
+      sequence_number: sequence,
+      output_index: 0,
+      item_id: call.item,
+      arguments: call.arguments,
+    })
+    sequence += 1
+    lines.push({
+      type: "response.output_item.done",
+      sequence_number: sequence,
+      output_index: 0,
+      item: {
+        type: "function_call",
+        id: call.item,
+        call_id: call.id,
+        name: call.name,
+        arguments: call.arguments,
+        status: "completed",
+      },
+    })
+  }
+
+  sequence += 1
+  lines.push({
+    type: "response.completed",
+    sequence_number: sequence,
+    response: {
+      incomplete_details: null,
+      service_tier: null,
+      usage: {
+        input_tokens: 0,
+        input_tokens_details: { cached_tokens: null },
+        output_tokens: 0,
+        output_tokens_details: { reasoning_tokens: null },
+      },
+    },
+  })
+
+  return lines
+}
+
 function toolFile(workspace: string) {
   return path.join(workspace, "src/index.ts")
 }
 
 function toolScenarioDeltas(scenario: Scenario, workspace: string) {
+  if (scenario === "task-ts") {
+    return toolCallDeltas("task", {
+      description: "Perf subagent task",
+      prompt: `Read and summarize ${toolFile(workspace)} in 3 bullets.`,
+      subagent_type: "explore",
+      command: "perf task scenario",
+    })
+  }
+
   if (scenario === "lsp-ts") {
     return toolCallDeltas("lsp", {
       operation: "documentSymbol",
@@ -394,7 +628,7 @@ function scenarioText(scenario: Scenario) {
     return "```ts\nconst value = await run();\nconsole.log(value)\n```\n"
   }
 
-  if (scenario === "read-ts" || scenario === "lsp-ts") {
+  if (needsToolTurn(scenario)) {
     return "tool complete "
   }
 
@@ -417,11 +651,11 @@ function finishChunk(reason: string) {
   }
 }
 
-function isolatedEnv(args: Args, home: string, llmUrl: string) {
+function isolatedEnv(args: Args, home: string, llmUrl: string, perf?: { artifactDir: string; index: number }) {
   const config = testProviderConfig(llmUrl)
   config.lsp = args.enableLsp
 
-  return {
+  const env = {
     OPENCODE_TEST_HOME: home,
     HOME: home,
     XDG_CONFIG_HOME: path.join(home, ".config"),
@@ -441,6 +675,39 @@ function isolatedEnv(args: Args, home: string, llmUrl: string) {
     OPENCODE_EXPERIMENTAL_LSP_TOOL: args.scenario === "lsp-ts" ? "1" : "0",
     OPENCODE_AUTH_CONTENT: "{}",
   }
+
+  if (!perf) {
+    return env
+  }
+
+  return {
+    ...env,
+    ...(args.memoryCheckpoints && perf.index < args.memoryInstances
+        ? {
+            OPENCODE_PERF_MEMORY_DIR: path.join(perf.artifactDir, "memory"),
+            OPENCODE_PERF_MEMORY_CHECKPOINTS: args.memoryCheckpointNames,
+            OPENCODE_PERF_INSTANCE: String(perf.index + 1),
+          }
+      : {}),
+    ...(args.heapSnapshots && perf.index < args.heapInstances
+      ? {
+          OPENCODE_PERF_MEMORY_DIR: path.join(perf.artifactDir, "memory"),
+          OPENCODE_PERF_MEMORY_CHECKPOINTS: args.memoryCheckpointNames,
+          OPENCODE_PERF_INSTANCE: String(perf.index + 1),
+          OPENCODE_PERF_HEAP_DIR: path.join(perf.artifactDir, "heaps"),
+          OPENCODE_PERF_HEAP_INSTANCE: String(perf.index + 1),
+          OPENCODE_PERF_HEAP_CHECKPOINTS: args.heapCheckpoints,
+        }
+        : {}),
+  }
+}
+
+function needsRepoWorkspace(scenario: Scenario) {
+  return scenario === "read-ts" || scenario === "lsp-ts" || scenario === "task-ts"
+}
+
+function needsToolTurn(scenario: Scenario) {
+  return scenario === "read-ts" || scenario === "lsp-ts" || scenario === "task-ts"
 }
 
 function sampleProcesses(parentPids: number[], samples: ProcessSample[], start: number, sampleMs: number) {
@@ -550,7 +817,9 @@ function summarize(input: {
     scenario: input.args.scenario,
     mode: input.args.mode,
     runner: input.args.runner,
+    smol: input.args.smol,
     attach: input.args.attach,
+    warm_home: input.args.warmHome,
     target: input.args.mode === "tui" ? "opencode child" : "run process",
     duration_ms: input.durationMs,
     peak_cpu: max(targetSamples.map((sample) => sample.cpu)),
@@ -630,7 +899,9 @@ function printRun(index: number, summary: Summary, artifactDir: string) {
       `run ${index}`,
       `${summary.mode}/${summary.scenario}`,
       `runner=${summary.runner}`,
+      `smol=${summary.smol}`,
       `attach=${summary.attach}`,
+      `warm_home=${summary.warm_home}`,
       `target=${summary.target}`,
       `duration=${duration}s`,
       `peak_cpu=${summary.peak_cpu}%`,
@@ -655,7 +926,9 @@ function printAggregate(summaries: Summary[]) {
     [
       `${first.mode}/${first.scenario}`,
       `runner=${first.runner}`,
+      `smol=${first.smol}`,
       `attach=${first.attach}`,
+      `warm_home=${first.warm_home}`,
       `runs=${summaries.length}`,
       `median_peak_cpu=${median(summaries.map((summary) => summary.peak_cpu))}%`,
       `median_peak_rss=${median(summaries.map((summary) => summary.peak_rss_mb))}MB`,
@@ -674,13 +947,17 @@ function parseArgs(argv: string[]): Args {
   }
 
   const mode = enumValue(values.get("mode") ?? "tui", ["run-json", "tui"])
+  const instances = positiveInt(values.get("instances") ?? "1", "instances")
   return {
     mode,
-    scenario: enumValue(values.get("scenario") ?? "markdown", ["text", "markdown", "code", "read-ts", "lsp-ts"]),
+    scenario: enumValue(values.get("scenario") ?? "markdown", ["text", "markdown", "code", "read-ts", "lsp-ts", "task-ts"]),
     runner: enumValue(values.get("runner") ?? "source", ["source", "binary"]),
+    smol: booleanValue(values.get("smol") ?? "false", "smol"),
+    cpuProfile: booleanValue(values.get("cpu-profile") ?? "false", "cpu-profile"),
     workspace: values.get("workspace"),
     title: values.get("title"),
     attach: booleanValue(values.get("attach") ?? "false", "attach"),
+    warmHome: booleanValue(values.get("warm-home") ?? "true", "warm-home"),
     runs: positiveInt(values.get("runs") ?? "1", "runs"),
     chunks: positiveInt(values.get("chunks") ?? "250", "chunks"),
     chunkSize: positiveInt(values.get("chunk-size") ?? "12", "chunk-size"),
@@ -688,9 +965,19 @@ function parseArgs(argv: string[]): Args {
     timeoutMs: positiveInt(values.get("timeout-ms") ?? "20000", "timeout-ms"),
     sampleMs: positiveInt(values.get("sample-ms") ?? "100", "sample-ms"),
     settleMs: positiveInt(values.get("settle-ms") ?? "500", "settle-ms"),
-    instances: positiveInt(values.get("instances") ?? "1", "instances"),
+    instances,
     enableLsp: booleanValue(values.get("enable-lsp") ?? "false", "enable-lsp"),
     disableLspDownload: booleanValue(values.get("disable-lsp-download") ?? "false", "disable-lsp-download"),
+    memoryCheckpoints: booleanValue(
+      values.get("memory-checkpoints") ?? values.get("heap-snapshots") ?? "false",
+      "memory-checkpoints",
+    ),
+    memoryInstances: positiveInt(values.get("memory-instances") ?? String(instances), "memory-instances"),
+    memoryCheckpointNames:
+      values.get("memory-checkpoint-names") ?? "boot,before-turn,stream-ready,after-turn,idle,before-close",
+    heapSnapshots: booleanValue(values.get("heap-snapshots") ?? "false", "heap-snapshots"),
+    heapInstances: positiveInt(values.get("heap-instances") ?? "1", "heap-instances"),
+    heapCheckpoints: values.get("heap-checkpoints") ?? "boot,before-turn,stream-ready,after-turn,idle,before-close",
   }
 }
 

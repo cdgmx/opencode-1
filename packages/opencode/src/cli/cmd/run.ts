@@ -29,8 +29,11 @@ import { InstanceRef } from "@/effect/instance-ref"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
 
-const runtimeTask = import("./run/runtime")
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
+
+function runtimeTask() {
+  return import("./run/runtime")
+}
 
 function pick(value: string | undefined): ModelInput | undefined {
   if (!value) return undefined
@@ -804,7 +807,7 @@ export const RunCommand = effectCmd({
         }
 
         const model = pick(args.model)
-        const { runInteractiveMode } = await runtimeTask
+        const { runInteractiveMode } = await runtimeTask()
         try {
           await runInteractiveMode({
             sdk: client,
@@ -831,7 +834,7 @@ export const RunCommand = effectCmd({
 
       if (args.interactive && !args.attach && !args.session && !args.continue) {
         const model = pick(args.model)
-        const { runInteractiveLocalMode } = await runtimeTask
+        const { runInteractiveLocalMode } = await runtimeTask()
         const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
           const { Server } = await import("@/server/server")
           const request = new Request(input, init)

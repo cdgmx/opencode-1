@@ -32,6 +32,18 @@ import { formatModelLabel } from "./variant.shared"
 
 const FOOTER_HEIGHT = 7
 
+function positiveEnvInt(name: string) {
+  const value = Number(process.env[name])
+  if (Number.isInteger(value) && value > 0) return value
+  return undefined
+}
+
+function runRendererUseThread() {
+  if (process.env.OPENCODE_RUN_TUI_USE_THREAD === "false") return false
+  if (process.env.OPENCODE_RUN_TUI_USE_THREAD === "true") return true
+  return undefined
+}
+
 type SplashState = {
   entry: boolean
   exit: boolean
@@ -174,10 +186,12 @@ export async function createRuntimeLifecycle(input: LifecycleInput): Promise<Lif
       let unregisterKeymap: (() => void) | undefined
 
       try {
+        const useThread = runRendererUseThread()
         const renderer = await createCliRenderer({
           stdin: source.stdin,
-          targetFps: 30,
-          maxFps: 60,
+          targetFps: positiveEnvInt("OPENCODE_RUN_TUI_TARGET_FPS") ?? 30,
+          maxFps: positiveEnvInt("OPENCODE_RUN_TUI_MAX_FPS") ?? 60,
+          ...(useThread === undefined ? {} : { useThread }),
           useMouse: false,
           autoFocus: false,
           openConsoleOnError: false,

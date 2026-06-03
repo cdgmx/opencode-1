@@ -19,6 +19,7 @@ import { createRunDemo } from "./demo"
 import { resolveModelInfo, resolveRunTuiConfig, resolveSessionInfo } from "./runtime.boot"
 import { createRuntimeLifecycle } from "./runtime.lifecycle"
 import { recordRunSpanError, setRunSpanAttributes, withRunSpan } from "./otel"
+import { writePerfHeapSnapshot } from "./perf.heap"
 import { trace } from "./trace"
 import { cycleVariant, formatModelLabel, resolveSavedVariant, resolveVariant, saveVariant } from "./variant.shared"
 import type { LocalReplayAnchor, LocalReplayRow, RunInput, RunPrompt, RunProvider, StreamCommit } from "./types"
@@ -380,6 +381,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
         },
       })
       const footer = shell.footer
+      writePerfHeapSnapshot("boot")
       const rememberLocal = (commit: StreamCommit, after?: LocalReplayAnchor) => {
         state.localRows = [...state.localRows, { commit, after }].slice(-LOCAL_REPLAY_ROW_LIMIT)
       }
@@ -508,6 +510,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
           }
 
           state.selectSubagent = (sessionID) => handle.selectSubagent(sessionID)
+          writePerfHeapSnapshot("stream-ready")
           return { mod, handle }
         })()
         state.stream = next
@@ -759,6 +762,7 @@ async function runInteractiveRuntime(input: RunRuntimeInput): Promise<void> {
           await state.stream?.then((item) => item.handle.close()).catch(() => {})
         }
       } finally {
+        writePerfHeapSnapshot("before-close")
         const title = await resolveExitTitle(ctx, input, state)
 
         await shell.close({

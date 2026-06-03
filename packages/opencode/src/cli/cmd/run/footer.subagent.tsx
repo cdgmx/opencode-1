@@ -10,6 +10,8 @@ import type { RunFooterTheme, RunTheme } from "./theme"
 
 export const SUBAGENT_INSPECTOR_ROWS = 14
 
+const STATIC_SPINNER = process.env.OPENCODE_RUN_TUI_STATIC_SPINNER === "1"
+
 function statusColor(theme: RunFooterTheme, status: FooterSubagentTab["status"]) {
   if (status === "completed") {
     return theme.highlight
@@ -124,7 +126,16 @@ export function RunFooterSubagentBody(props: {
             <box width="100%" flexDirection="row" gap={1} paddingBottom={1} flexShrink={0}>
               {current().status === "running" ? (
                 <box flexShrink={0}>
-                  <spinner frames={SPINNER_FRAMES} interval={80} color={statusColor(footer(), current().status)} />
+                  <Show
+                    when={!STATIC_SPINNER}
+                    fallback={
+                      <text fg={statusColor(footer(), current().status)} wrapMode="none" truncate>
+                        {statusIcon(current().status)}
+                      </text>
+                    }
+                  >
+                    <spinner frames={SPINNER_FRAMES} interval={80} color={statusColor(footer(), current().status)} />
+                  </Show>
                 </box>
               ) : (
                 <text fg={statusColor(footer(), current().status)} wrapMode="none" truncate flexShrink={0}>

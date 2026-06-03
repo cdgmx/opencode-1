@@ -138,7 +138,11 @@ function num(value: unknown): number | undefined {
   return undefined
 }
 
-function inputLabel(input: Record<string, unknown>): string | undefined {
+function inputLabel(input: Record<string, unknown> | undefined): string | undefined {
+  if (!input) {
+    return undefined
+  }
+
   const description = text(input.description)
   if (description) {
     return description
@@ -192,45 +196,6 @@ function callKey(messageID: string | undefined, callID: string | undefined): str
   }
 
   return `${messageID}:${callID}`
-}
-
-function compactToolState(part: ToolPart): ToolPart["state"] {
-  if (part.state.status === "pending") {
-    return {
-      status: "pending",
-      input: part.state.input,
-      raw: part.state.raw,
-    }
-  }
-
-  if (part.state.status === "running") {
-    return {
-      status: "running",
-      input: part.state.input,
-      time: part.state.time,
-      ...(part.state.metadata ? { metadata: part.state.metadata } : {}),
-      ...(part.state.title ? { title: part.state.title } : {}),
-    }
-  }
-
-  if (part.state.status === "completed") {
-    return {
-      status: "completed",
-      input: part.state.input,
-      output: part.state.output,
-      title: part.state.title,
-      metadata: part.state.metadata,
-      time: part.state.time,
-    }
-  }
-
-  return {
-    status: "error",
-    input: part.state.input,
-    error: part.state.error,
-    time: part.state.time,
-    ...(part.state.metadata ? { metadata: part.state.metadata } : {}),
-  }
 }
 
 function recent<T>(input: Iterable<T>, limit: number) {
@@ -839,4 +804,42 @@ export function reduceSubagentData(input: {
     thinking: input.thinking,
     limits: input.limits,
   })
+}
+function compactToolState(part: ToolPart): ToolPart["state"] {
+  if (part.state.status === "pending") {
+    return {
+      status: "pending",
+      input: part.state.input,
+      raw: part.state.raw,
+    }
+  }
+
+  if (part.state.status === "running") {
+    return {
+      status: "running",
+      input: part.state.input,
+      time: part.state.time,
+      ...(part.state.metadata ? { metadata: part.state.metadata } : {}),
+      ...(part.state.title ? { title: part.state.title } : {}),
+    }
+  }
+
+  if (part.state.status === "completed") {
+    return {
+      status: "completed",
+      input: part.state.input,
+      output: part.state.output,
+      title: part.state.title,
+      metadata: part.state.metadata,
+      time: part.state.time,
+    }
+  }
+
+  return {
+    status: "error",
+    input: part.state.input,
+    error: part.state.error,
+    time: part.state.time,
+    ...(part.state.metadata ? { metadata: part.state.metadata } : {}),
+  }
 }

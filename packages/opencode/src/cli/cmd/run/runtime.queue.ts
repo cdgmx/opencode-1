@@ -10,6 +10,7 @@
 // Resolves when the footer closes and all in-flight work finishes.
 import * as Locale from "@/util/locale"
 import { MessageID, PartID } from "@/session/schema"
+import { writePerfHeapSnapshot } from "./perf.heap"
 import { isExitCommand, isNewCommand } from "./prompt.shared"
 import type { FooterApi, FooterEvent, FooterQueuedPrompt, RunPrompt } from "./types"
 
@@ -188,6 +189,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
 
           try {
             await input.footer.idle()
+            writePerfHeapSnapshot("before-turn")
             if (state.closed) {
               break
             }
@@ -223,6 +225,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
             if (next.type === "error") {
               throw next.error
             }
+            writePerfHeapSnapshot("after-turn")
           } finally {
             if (state.ctrl === ctrl) {
               state.ctrl = undefined
@@ -257,6 +260,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
             queue: state.queue.length,
           },
         )
+        writePerfHeapSnapshot("idle")
       }
 
       finish()
@@ -327,10 +331,6 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
   })
 
   try {
-    if (state.closed) {
-      return
-    }
-
     submit({
       text: input.initialInput ?? "",
       parts: [],

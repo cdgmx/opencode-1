@@ -2,42 +2,130 @@
 
 ## Current Harness Note
 
-The active harness has been simplified into a quick black-box CPU/RAM runner in `packages/opencode/script/perf-run.ts`.
+The active harness in `packages/opencode/script/perf-run.ts` now covers the multi-agent shape we were missing:
 
-Current default use:
+- multiple `opencode` CLI instances
+- `run-json` and interactive TUI modes
+- local server-per-process and attach-to-one-server modes
+- source and compiled binary runners
+- `text`, `markdown`, `code`, `read-ts`, and `lsp-ts` scenarios
+- LSP enable/disable and `OPENCODE_DISABLE_LSP_DOWNLOAD`
+- process-kind CPU/RSS breakdown
+- memory checkpoints and heap snapshots
+- per-home warmup before sampling so first-run DB migration is not counted as steady-state runtime cost
+
+Current representative command:
 
 - `cd packages/opencode`
-- `bun run perf:run`
-
-The detailed experiments below are historical results from the earlier, larger harness.
+- `bun run script/perf-run.ts --mode tui --scenario lsp-ts --instances 10 --enable-lsp true --disable-lsp-download true --memory-checkpoints true --timeout-ms 80000 --settle-ms 1000 --sample-ms 500`
 
 HTML report: `perf/opencode-runtime-performance-report.html`
 
+## Latest Finding
+
+The strongest current evidence does **not** point to one OpenTUI leak or one runaway LSP as the primary root cause. The main cost is duplicated `opencode` runtime footprint per CLI process. OpenTUI and LSP increase the curve, but the measured 10-instance memory is mostly the ten `opencode` processes themselves.
+
+Attach-mode now makes the next conclusion explicit: the dominant remaining memory problem is the client, not the shared server.
+
+Evidence:
+
+- 10 local TUI instances, no LSP, warmed homes:
+  - before lazy/deferred import fix: `20260603T094222Z-tui-text-run-1`
+  - tree peak CPU: `804.6%`
+  - tree peak RSS: `3024.41MB`
+- same scenario after lazy CLI command loading and deferred interactive runtime import:
+  - artifact: `20260603T094632Z-tui-text-run-1`
+  - tree peak CPU: `684.2%`
+  - tree peak RSS: `2581.81MB`
+  - improvement: about `442.6MB` lower peak RSS and `120.4` CPU percentage-points lower
+- memory checkpoints after the fix still show the per-process baseline is high:
+  - boot sum RSS: `2387.5MB`
+  - boot heap used: `1480.1MB`
+  - boot external memory: `745.5MB`
+  - idle sum RSS: `2294.4MB`
+  - idle heap used: `1616.6MB`
+  - idle external memory: `836.6MB`
+
+This means the fix helped, but it did not erase the core issue: every interactive CLI still loads a large runtime.
+
 ## Latest Multi-Instance/LSP Result
 
-- Harness gap fixed: `perf-run.ts` can now run multiple CLI instances, `read-ts` / `lsp-ts` tool scenarios, LSP on/off, source vs compiled binary, and attach mode.
-- 10 local TUI instances with LSP scenario:
+- 10 local TUI instances with LSP scenario, before the lazy/deferred import fix:
   - artifact: `20260603T083916Z-tui-lsp-ts-run-1`
   - tree peak CPU: `735.1%`
   - tree peak RSS: `3017.85MB`
   - process-kind RSS: `opencode` `2986.18MB`, LSP `208.78MB`
+- 10 local TUI instances with LSP scenario, after the lazy/deferred import fix:
+  - artifact: `20260603T094721Z-tui-lsp-ts-run-1`
+  - tree peak CPU: `776.7%`
+  - tree peak RSS: `3058.39MB`
+  - process-kind RSS: `opencode` `3052.59MB`, LSP `160.92MB`, git `64.28MB`, other `139.01MB`
+  - checkpoint idle heap used: `1755.5MB`
+  - checkpoint idle external memory: `972.3MB`
 - 10 attach-mode TUI clients against one shared server:
-  - artifact: `20260603T085711Z-tui-lsp-ts-run-1`
-  - tree peak CPU: `750.1%`
-  - tree peak RSS: `3162.83MB`
-  - conclusion: sharing a server does not solve the 10-client memory curve because client/TUI processes still dominate.
-- Compiled binary 10-instance run:
+  - artifact: `20260603T094301Z-tui-text-run-1`
+  - tree peak CPU: `679.4%`
+  - tree peak RSS: `2766.12MB`
+  - process-kind RSS: shared server/wrapper `422.58MB`, clients `2660.96MB`
+  - conclusion: sharing one server helps only modestly because the client/TUI processes still dominate.
+  - stronger conclusion: about `85%` of attach-mode RSS is still in clients, so server-side-only work is not the next fix path.
+- 10 subagent-heavy `task`-tool clients, attach mode:
+  - artifact: `20260603T115333Z-tui-task-ts-run-1`
+  - tree peak CPU: `647.2%`
+  - tree peak RSS: `2607.88MB`
+  - conclusion: a `task()`/subagent proxy is measurably heavy, but still far below the 10-12GB field report, so the synthetic harness is closer now but still not reproducing the full real-world spike path.
+- 10 subagent-heavy `task`-tool clients, local mode:
+  - artifact: `20260603T115636Z-tui-task-ts-run-1`
+  - tree peak CPU: `555.2%`
+  - tree peak RSS: `2331.29MB`
+  - conclusion: in the current synthetic subagent scenario, local mode is actually lighter than attach mode, which reinforces that the remaining issue is not just server duplication.
+- Compiled binary 10-instance run before current source fixes:
   - artifact: `20260603T085847Z-tui-lsp-ts-run-1`
   - tree peak CPU: `699%`
   - tree peak RSS: `3119.73MB`
   - conclusion: source-mode overhead is not the main explanation.
-- Root cause update:
-  - dominant cost is duplicated interactive `opencode`/TUI runtime per CLI process.
-  - LSPs are an amplifier, not the main measured CPU/RSS source in this harness.
-- Kept fix:
-  - TypeScript LSP now honors `OPENCODE_DISABLE_LSP_DOWNLOAD`; this prevents unwanted package lookup/download work but is not expected to solve the main 10-instance TUI memory curve.
-- Rejected fixes:
-  - queue throttling, fixed title, incremental GC, and full GC were measured and not kept because results were noisy, worse, or not reproducible.
+
+## Heap Snapshot Finding
+
+Heap snapshots did not show a single unbounded JavaScript leak. The snapshot evidence points to a large loaded runtime/module graph:
+
+- artifact: `20260603T091900Z-tui-lsp-ts-run-1`
+- retained heap parsed from snapshot: about `176.9MB`
+- largest groups:
+  - compiled code: `63MB`
+  - module records: `20.49MB`
+  - array buffers: `16.78MB`
+  - strings: `13.19MB`
+  - lexical environments: `11.95MB`
+
+Important caveat: heap snapshot collection itself inflates RSS, so this evidence is useful for retained heap composition, not for steady-state RSS.
+
+## Fixes Kept
+
+- Lazy command registration in `src/index.ts`:
+  - `opencode run` now imports only the run command instead of loading the full CLI command graph before yargs dispatch.
+- Deferred interactive runtime import in `src/cli/cmd/run.ts`:
+  - non-interactive `run-json` no longer loads the interactive runtime.
+  - measured `run-json` local RSS improved from `2907.74MB` to `2496.17MB`.
+- TypeScript LSP now honors `OPENCODE_DISABLE_LSP_DOWNLOAD`:
+  - prevents unwanted package lookup/download work.
+- Semantic LSP operations now skip lint-only servers:
+  - `biome`, `eslint`, and `oxlint` are excluded for hover/definition/reference/document-symbol/call-hierarchy style operations.
+  - diagnostics still use all configured diagnostic servers.
+
+## Stop Doing These
+
+These lines of investigation are low-yield and should not be the default next step.
+They either moved work around, shaved off noise-level amounts, or failed to reproduce.
+
+- OpenTUI thread/FPS/static-spinner knobs: not a real CPU/RSS fix.
+- `OTUI_NO_NATIVE_RENDER=1`: not a real fix.
+- `--smol` source runner: did not explain or fix memory.
+- Queue throttling, fixed title, incremental GC, full GC: noisy, worse, or not reproducible.
+- Stream-path switches like `rich|plain|final`: changed where CPU burned, not how much.
+- Settle-cadence micro-tuning: below keep threshold or regressed.
+- Small text-delta batching tweaks: below keep threshold and not worth the behavior risk.
+- Cold-start investigation as a steady-state explanation: warm-home removed that harness artifact, but the high memory curve remained.
 
 ## Current Answer
 
@@ -74,6 +162,23 @@ HTML report: `perf/opencode-runtime-performance-report.html`
 5. Bypassing assistant/reasoning per-chunk flush reduced `writeStreaming`, but still did not materially lower peak CPU.
 6. Next step is still open; the remaining cost looks more like final rich render / surrounding runtime work than the per-chunk `writeStreaming` path.
 
+## Attach-Mode Conclusion
+
+- Attach mode already tested the strongest server-sharing hypothesis.
+- Result: server/wrapper RSS `422.58MB`, clients `2660.96MB`, total `2766.12MB`.
+- Interpretation: the shared server is not the first-order memory problem.
+- About `85%` of measured attach-mode RSS is still in clients.
+- Therefore server-side-only optimization is not the next path to pursue.
+- Next useful work should focus on thinning the attach/local interactive client.
+- Practical rule for future investigation: do not spend cycles on server-only hypotheses unless they also reduce client-side load or client-owned module/runtime duplication.
+
+## Subagent-Heavy Benchmark Note
+
+- Issue `#20695` suggests the worst field spikes come from subagent spawning with large accumulated context, plugin/skill load, and MCP schema fan-out.
+- To get closer to that path, the perf harness now has a `task-ts` scenario that emits a real `task` tool call with `subagent_type: "explore"`.
+- This is a better proxy than plain `text`, `read-ts`, or `lsp-ts` for subagent-heavy memory work.
+- It still does not reproduce the full field conditions from the issue: huge `opencode.db`, large installed skill/plugin sets, or many MCP schemas.
+
 ## Key Artifacts
 
 - Markdown Bun profile:
@@ -88,185 +193,47 @@ HTML report: `perf/opencode-runtime-performance-report.html`
   - perf run: `20260603T023358Z-tui-delta-burst-markdown-run-1`
   - CPU profile: `20260603T023436Z-tui-delta-burst-markdown-run-1/cpu-profile-1/CPU.48132789159.98732.md`
 
-## Experiment Log
+## Compact Experiment Log
 
-### H1: Shared-home DB contention is the main lag source
+### Confirmed
 
-- Test: 6-instance isolated vs shared-home real-workspace runs
-- Artifacts:
-  - isolated: `20260602T160141Z-multi-instance-slow-stream-run-1`
-  - shared: `20260602T160421Z-multi-instance-slow-stream-run-1`
-- Result:
-  - shared-home failed early with duplicate-index / lock issues
-  - isolated run still showed high CPU/process fan-out
-- Conclusion: failed as the main explanation
+- TUI is materially more expensive than `run-json` for the same mocked stream.
+- Snapshotting is a real amplifier in real workspaces, but not the core CPU root cause.
+- Bun-native CPU profiles are good enough for function-level attribution.
+- The hot path is the retained streaming write/render chain, not one isolated markdown-only function.
+- Plain text is still expensive; turning markdown off mostly shifts work into text rendering.
 
-### H2: Interactive TUI is more expensive than non-TUI for the same stream
+### Rejected
 
-- Test: mocked 2000-chunk stream, `run-json` vs `tui`
-- Artifacts:
-  - `20260603T005621Z-run-json-delta-burst-markdown-run-1`
-  - `20260603T005623Z-tui-delta-burst-text-run-1`
-  - `20260603T005627Z-tui-delta-burst-markdown-run-1`
-  - `20260603T005631Z-tui-delta-burst-code-run-1`
-- Result:
-  - `run-json`: `2.035s`, `124.6%`, `460.3MB`
-  - `tui text`: `4.027s`, `222.8%`, `890.13MB`
-  - `tui markdown`: `4.025s`, `242.8%`, `903.25MB`
-  - `tui code`: `3.928s`, `224.1%`, `903.31MB`
-- Conclusion: interactive renderer path is a dominant cost center
+- Shared-home DB contention is not the main steady-state lag explanation.
+  It is a startup/concurrency failure mode, not the core runtime CPU answer.
+- Lower FPS / event-driven mode is not a real fix.
+  It helped somewhat, but not enough to matter.
+- Chunk frequency is not the full explanation.
+  Coarser chunks helped markdown somewhat, but did not solve text or top-line CPU.
+- `plain` render mode is not a real fix.
+  It moved cost from markdown/layout into low-level text drawing.
+- `final` render mode is not a real fix.
+  It reduced one hotspot, but not top-line CPU.
+- Skipping per-chunk assistant/reasoning flush is not a real fix.
+  It cooled `writeStreaming`, but the run stayed CPU-hot.
+- Coarser settle cadence is not a keepable fix.
+  Improvement was below the keep threshold.
+- Pre-gating markdown/code updates and deferring text render is not a fix.
+  It regressed.
+- Batching adjacent text-delta publishes is not a keepable fix.
+  Improvement was too small and not worth the behavior risk.
 
-### H3: Snapshotting is a major real-workspace amplifier
+### Stop Here
 
-- Test: same 3-instance workspace run, snapshot on vs off
-- Artifacts:
-  - on: `20260603T010348Z-multi-instance-slow-stream-run-1`
-  - off: `20260603T010710Z-multi-instance-slow-stream-run-1`
-- Result:
-  - on: `24` child processes, `9` git children, `91.3%` peak git CPU
-  - off: `6` child processes, `0` git children
-- Conclusion: real amplifier, not the main CPU problem
+Do not spend more time by default on:
 
-### H4: Lower FPS / event-driven mode will fix the problem
+- FPS-style loop tuning
+- `plain|final` stream render switches
+- settle-cadence micro-tuning
+- tiny batching tweaks in the current stream path
 
-- Test: reduced loop, event mode, harsher low-FPS loop
-- Key artifacts:
-  - reduced loop: `20260603T011413Z-tui-delta-burst-markdown-run-1`
-  - event: `20260603T012656Z-tui-delta-burst-markdown-run-1`
-  - low-FPS: `20260603T012831Z-tui-delta-burst-markdown-run-1`
-- Result:
-  - helps somewhat
-  - not transformative
-- Conclusion: failed as a real fix
-
-### H5: Chunk frequency, not total text volume, is the main cause
-
-- Test: keep total volume ~8000 chars, vary chunk count/size
-- Artifacts:
-  - text: `20260603T012018Z`, `20260603T012023Z`, `20260603T012027Z`
-  - markdown: `20260603T012031Z`, `20260603T012036Z`, `20260603T012040Z`
-- Result:
-  - text: coarser chunks did not lower peak CPU
-  - markdown: coarser chunks lowered CPU/RSS somewhat
-- Conclusion: partly true, still wrong as the full explanation
-
-### H6: Bun-native profiles can identify the hottest internal function
-
-- Decision:
-  - removed custom perf counters
-  - switched to Bun-native CPU profiles only
-- Harness support:
-  - `--bun-cpu-prof true`
-  - clean exit via `OPENCODE_PERF_AUTO_CLOSE=1`
-- Conclusion: function-level attribution is reliable enough to guide fixes
-
-### H7: Markdown path is the hottest internal stack
-
-- Test: long Bun-profiled markdown run
-- Artifact:
-  - `20260603T015837Z-tui-delta-burst-markdown-run-1/cpu-profile-1/CPU.45974791271.58161.md`
-- Result:
-  - `async writeStreaming`: `21.3%` / `5.36s`
-  - `updateBlocks`: `13.2%` / `3.34s`
-  - `parseMarkdownIncremental`: `12.1%` / `3.07s`
-  - `updateLayout`: `10.1%` / `2.54s`
-  - `toLLMEvents`: `4.9%` / `1.24s`
-- Conclusion: confirmed hot path, not a fix
-
-### H8: Plain text should be cheap once markdown is removed
-
-- Test: long Bun-profiled text run
-- Artifact:
-  - `20260603T020003Z-tui-delta-burst-text-run-1/cpu-profile-1/CPU.46061978127.60276.md`
-- Result:
-  - `async writeStreaming`: `25.9%` / `6.84s`
-  - `updateBlocks`: `24.2%` / `6.40s`
-  - `parseMarkdownIncremental`: `24.1%` / `6.36s`
-- Conclusion: assumption was wrong; plain text is still expensive here
-
-### H9: Stream-path switches should materially lower CPU
-
-- Added switches:
-  - `--run-stream-render-mode rich|plain|final`
-  - `--run-stream-settle-mode eager|throttled|final`
-- Artifacts:
-  - rich: `20260603T021518Z-tui-delta-burst-markdown-run-1`
-  - plain: `20260603T021543Z-tui-delta-burst-markdown-run-1`
-  - final: `20260603T021609Z-tui-delta-burst-markdown-run-1`
-
-#### H9a: `plain` mode materially lowers CPU
-
-- Result:
-  - peak CPU: `206.1%` rich vs `217.0%` plain
-  - hotspot changed from markdown chain to text-buffer chain
-- Conclusion: failed; cost moved into low-level text drawing instead of disappearing
-
-#### H9b: `final` mode materially lowers CPU
-
-- Result:
-  - peak CPU: `206.1%` rich vs `205.4%` final
-  - `writeStreaming` dropped from `22.2% / 5.61s` to `16.5% / 4.30s`
-  - markdown/update/layout still stayed heavy
-- Conclusion: failed at the top-line CPU level; one function improved, total CPU did not
-
-### H10: Code bypass of assistant/reasoning per-chunk flush will materially lower CPU
-
-- Change tested:
-  - skip `flushActive(false, false)` in `RunScrollbackStream.writeStreaming` for non-tool commits unless `shouldSettle(..., false)` says to render
-- Artifacts:
-  - perf run: `20260603T023358Z-tui-delta-burst-markdown-run-1`
-  - CPU profile: `20260603T023436Z-tui-delta-burst-markdown-run-1/cpu-profile-1/CPU.48132789159.98732.md`
-- Result:
-  - targeted hotspot improved: `async writeStreaming` dropped to noise level in the patched CPU profile
-  - top-line CPU did not materially improve: patched run still hit `189.8%` child peak CPU
-- Conclusion: failed as a meaningful fix; per-chunk `writeStreaming` was real cost, but not enough of total cost to solve the problem
-
-### H11: Coarser retained streaming settle cadence will materially lower CPU
-
-- Hypothesis:
-  - fewer retained-stream settle/layout/render passes will reduce real runtime CPU
-- Change:
-  - `STREAM_SETTLE_INTERVAL_MS`: `75 -> 150`
-  - `STREAM_SETTLE_MIN_CHARS`: `256 -> 1024`
-- Result:
-  - markdown artifacts: `20260603T025553Z-tui-delta-burst-markdown-run-{1,2,3}`
-  - text artifacts: `20260603T025721Z-tui-delta-burst-text-run-{1,2,3}`
-  - markdown `child_max_cpu` runs: `170.8`, `184.7`, `201.0`; median `184.7` vs current representative `189.8` = `5.1` points better
-  - text `child_max_cpu` runs: `177.2`, `199.8`, `190.8`; median `190.8`
-  - profile rerun skipped because markdown result missed the keep threshold and triggered rollback rules
-- Conclusion:
-  - revert; markdown improvement was below the 10-point rollback floor and far below the 20-point keep threshold
-
-### H12: Pre-gate markdown/code updates and text render deferral will materially lower CPU
-
-- Change:
-  - moved markdown/code `renderable.content` and `renderable.streaming` updates behind `shouldSettle(...)`
-  - moved text `active.surface.render()` behind the row-commit precheck
-- Artifacts:
-  - markdown: `20260603T030456Z-tui-delta-burst-markdown-run-{1,2,3}`
-  - text: `20260603T030626Z-tui-delta-burst-text-run-{1,2,3}`
-- Result:
-  - markdown `child_max_cpu` runs: `195.7`, `199.7`, `193.3`; median `195.7` vs baseline `189.8` = `5.9` points worse
-  - text `child_max_cpu` runs: `199.0`, `199.6`, `202.1`; median `199.6` vs latest logged text median `190.8` = `8.8` points worse (`4.6%`)
-  - profile rerun skipped because markdown regressed and failed the rollback floor immediately
-- Conclusion:
-  - revert; markdown regressed versus baseline, so this packet did not materially lower CPU
-
-### H13: Batch adjacent text-delta publishes in the session processor
-
-- Change:
-  - batched adjacent `text-delta` publishes in `packages/opencode/src/session/processor.ts` with a `256`-character cap
-  - flushed before non-`text-delta` boundaries and terminal cleanup to preserve ordered output and final delivery
-- Artifacts:
-  - markdown: `20260603T032137Z-tui-delta-burst-markdown-run-{1,2,3}`
-  - text: `20260603T032302Z-tui-delta-burst-text-run-{1,2,3}`
-- Result:
-  - markdown `child_max_cpu` runs: `200.3`, `187.2`, `170.8`; median `187.2` vs baseline `189.8` = `2.6` points better
-  - text `child_max_cpu` runs: `193.3`, `196.3`, `187.8`; median `193.3` vs latest logged text median `190.8` = `2.5` points worse (`1.3%`)
-  - profile rerun skipped because markdown improvement missed both the `10`-point rollback floor and the final `15`-point keep bar
-  - quick smoke review found no ordered-stream or final-flush bug in code, but the raw TUI artifact still looked chunkier under the `256`-character cap
-- Conclusion:
-  - revert and stop; markdown improvement was not material, so this final bounded packet does not justify keeping the change
+These ideas were tested already. They did not materially lower top-line CPU, or they regressed, or they only moved the work.
 
 ## Best Current Summary
 

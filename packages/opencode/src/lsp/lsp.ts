@@ -98,6 +98,9 @@ const kinds = [
   SymbolKind.Enum,
 ]
 
+const diagnosticOnlyServers = new Set(["biome", "eslint", "oxlint"])
+const semanticServer = (server: LSPServer.Info) => !diagnosticOnlyServers.has(server.id)
+
 const filterExperimentalServers = (servers: Record<string, LSPServer.Info>, flags: RuntimeFlags.Info) => {
   if (flags.experimentalLspTy) {
     if (servers["pyright"]) {
@@ -209,7 +212,7 @@ export const layer = Layer.effect(
       }),
     )
 
-    const getClients = Effect.fnUntraced(function* (file: string) {
+    const getClients = Effect.fnUntraced(function* (file: string, include?: (server: LSPServer.Info) => boolean) {
       const ctx = yield* InstanceState.context
       if (!containsPath(file, ctx)) return [] as LSPClient.Info[]
       const s = yield* InstanceState.get(state)
@@ -260,6 +263,7 @@ export const layer = Layer.effect(
         }
 
         for (const server of Object.values(s.servers)) {
+          if (include && !include(server)) continue
           if (server.extensions.length && !server.extensions.includes(extension)) continue
 
           const root = await server.root(file, ctx)
@@ -306,6 +310,11 @@ export const layer = Layer.effect(
 
     const run = Effect.fnUntraced(function* <T>(file: string, fn: (client: LSPClient.Info) => Promise<T>) {
       const clients = yield* getClients(file)
+      return yield* Effect.promise(() => Promise.all(clients.map((x) => fn(x))))
+    })
+
+    const runSemantic = Effect.fnUntraced(function* <T>(file: string, fn: (client: LSPClient.Info) => Promise<T>) {
+      const clients = yield* getClients(file, semanticServer)
       return yield* Effect.promise(() => Promise.all(clients.map((x) => fn(x))))
     })
 
@@ -385,7 +394,7 @@ export const layer = Layer.effect(
     })
 
     const hover = Effect.fn("LSP.hover")(function* (input: LocInput) {
-      return yield* run(input.file, (client) =>
+      return yield* runSemantic(input.file, (client) =>
         client.connection
           .sendRequest("textDocument/hover", {
             textDocument: { uri: pathToFileURL(input.file).href },
@@ -396,7 +405,7 @@ export const layer = Layer.effect(
     })
 
     const definition = Effect.fn("LSP.definition")(function* (input: LocInput) {
-      const results = yield* run(input.file, (client) =>
+      const results = yield* runSemantic(input.file, (client) =>
         client.connection
           .sendRequest("textDocument/definition", {
             textDocument: { uri: pathToFileURL(input.file).href },
@@ -408,7 +417,7 @@ export const layer = Layer.effect(
     })
 
     const references = Effect.fn("LSP.references")(function* (input: LocInput) {
-      const results = yield* run(input.file, (client) =>
+      const results = yield* runSemantic(input.file, (client) =>
         client.connection
           .sendRequest("textDocument/references", {
             textDocument: { uri: pathToFileURL(input.file).href },
@@ -421,7 +430,7 @@ export const layer = Layer.effect(
     })
 
     const implementation = Effect.fn("LSP.implementation")(function* (input: LocInput) {
-      const results = yield* run(input.file, (client) =>
+      const results = yield* runSemantic(input.file, (client) =>
         client.connection
           .sendRequest("textDocument/implementation", {
             textDocument: { uri: pathToFileURL(input.file).href },
@@ -434,7 +443,7 @@ export const layer = Layer.effect(
 
     const documentSymbol = Effect.fn("LSP.documentSymbol")(function* (uri: string) {
       const file = fileURLToPath(uri)
-      const results = yield* run(file, (client) =>
+      const results = yield* runSemantic(file, (client) =>
         client.connection.sendRequest("textDocument/documentSymbol", { textDocument: { uri } }).catch(() => []),
       )
       return (results.flat() as (DocumentSymbol | Symbol)[]).filter(Boolean)
@@ -451,7 +460,7 @@ export const layer = Layer.effect(
     })
 
     const prepareCallHierarchy = Effect.fn("LSP.prepareCallHierarchy")(function* (input: LocInput) {
-      const results = yield* run(input.file, (client) =>
+      const results = yield* runSemantic(input.file, (client) =>
         client.connection
           .sendRequest("textDocument/prepareCallHierarchy", {
             textDocument: { uri: pathToFileURL(input.file).href },
@@ -466,7 +475,7 @@ export const layer = Layer.effect(
       input: LocInput,
       direction: "callHierarchy/incomingCalls" | "callHierarchy/outgoingCalls",
     ) {
-      const results = yield* run(input.file, async (client) => {
+      const results = yield* runSemantic(input.file, async (client) => {
         const items = await client.connection
           .sendRequest<unknown[] | null>("textDocument/prepareCallHierarchy", {
             textDocument: { uri: pathToFileURL(input.file).href },

@@ -69,6 +69,8 @@ const EMPTY_BORDER = {
   rightT: "",
 }
 
+const STATIC_SPINNER = process.env.OPENCODE_RUN_TUI_STATIC_SPINNER === "1"
+
 type RunFooterViewProps = {
   directory: string
   findFiles: (query: string) => Promise<string[]>
@@ -733,7 +735,16 @@ export function RunFooterView(props: RunFooterViewProps) {
 
                         <Show when={busy() && !exiting()}>
                           <box id="run-direct-footer-status-spinner" flexShrink={0}>
-                            <spinner color={spin().color} frames={spin().frames} interval={40} />
+                            <Show
+                              when={!STATIC_SPINNER}
+                              fallback={
+                                <text fg={theme().highlight} wrapMode="none" truncate>
+                                  ■
+                                </text>
+                              }
+                            >
+                              <spinner color={spin().color} frames={spin().frames} interval={40} />
+                            </Show>
                           </box>
 
                           <text
