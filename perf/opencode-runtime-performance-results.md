@@ -250,6 +250,41 @@ These ideas were tested already. They did not materially lower top-line CPU, or 
   - most tested switches changed where CPU burns, not how much burns
   - even a direct code bypass that cools `writeStreaming` did not solve top-line CPU
 
+## 2026-06-04 TUI-Only Recheck
+
+- Reverted temporary stream/render changes before this pass.
+- Browser concepts like CSS/DOM/FlashList do not apply here. The equivalent client-side surfaces are Solid signals/stores, OpenTUI renderables, Yoga layout, native text buffers, split-footer scrollback surfaces, and keymap/input layers.
+- New minimal binary baseline:
+  - artifact: `20260603T171416Z-tui-text-run-1`
+  - command shape: 10 attached TUI clients, binary runner, `text`, `chunks=1`, `chunk_size=1`
+  - result: `tree_peak_cpu=567.5%`, `tree_peak_rss=2543.48MB`
+  - interpretation: a near-empty interactive client already has a large fixed CPU/RSS floor. This is not primarily caused by markdown volume, subagent output volume, or LSP output volume in the current harness.
+- Minimal binary `run-json` comparison:
+  - artifact: `20260603T171457Z-run-json-text-run-1`
+  - result: `tree_peak_cpu=561.1%`, `tree_peak_rss=2196.91MB`
+  - interpretation: source/runtime and startup are still major confounders, but TUI adds about `346.57MB` tree RSS across 10 clients in this minimal comparison.
+- Rejected fast boot:
+  - artifact: `20260603T171152Z-tui-task-ts-run-1`
+  - result: `tree_peak_cpu=730.9%`, `tree_peak_rss=2625.01MB`
+  - baseline was `701.1%` CPU / `2325.66MB` RSS, so `OPENCODE_FAST_BOOT=1` did not help.
+- Rejected low FPS on the minimal binary case:
+  - artifact: `20260603T171556Z-tui-text-run-1`
+  - result: `tree_peak_cpu=554.5%`, `tree_peak_rss=2521.91MB`
+  - only a small CPU change and no memory fix.
+- Rejected keymap-skip probe:
+  - artifact: `20260603T171856Z-tui-text-run-1`
+  - result: `tree_peak_cpu=587.5%`, `tree_peak_rss=2478.28MB`
+  - about `6.5MB/client` RSS improvement, but CPU worsened. Not a keepable fix.
+- Source-runner CPU profile for the minimal TUI case:
+  - artifact: `20260603T171721Z-tui-text-run-1/cpu-profile/CPU.101102111541.42674.md`
+  - profile is source-biased: hot samples are mostly Bun/source transpilation, native frames, and OpenTUI shutdown cleanup. Do not use it as binary runtime proof.
+
+### Revised Hypothesis
+
+- The current 10-client lag/RSS issue has a large fixed per-client TUI/runtime component before heavy streaming is involved.
+- Streaming retained surfaces are still a confirmed hot path under real output, but they are not sufficient to explain the minimal benchmark floor.
+- Next useful tests should measure and thin direct-run interactive client initialization and resident module/native memory, especially OpenTUI renderer/native buffers, Solid/footer runtime, and server/API client duplication per attached TUI.
+
 ## Repro Commands
 
 ```sh
