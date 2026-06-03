@@ -4,12 +4,16 @@ import path from "node:path"
 import { testProviderConfig } from "../test/lib/test-provider"
 
 type Mode = "run-json" | "tui"
-type Scenario = "text" | "markdown" | "code"
+type Scenario = "text" | "markdown" | "code" | "read-ts" | "lsp-ts"
+type Runner = "source" | "binary"
 
 type Args = {
   mode: Mode
   scenario: Scenario
+  runner: Runner
   workspace?: string
+  title?: string
+  attach: boolean
   runs: number
   chunks: number
   chunkSize: number
@@ -17,9 +21,12 @@ type Args = {
   timeoutMs: number
   sampleMs: number
   settleMs: number
+  instances: number
+  enableLsp: boolean
+  disableLspDownload: boolean
 }
 
-type ProcessKind = "wrapper" | "opencode" | "shell" | "git" | "watcher" | "other"
+type ProcessKind = "wrapper" | "opencode" | "shell" | "git" | "lsp" | "watcher" | "npm" | "other"
 
 type ProcessSample = {
   time: string
@@ -35,6 +42,8 @@ type ProcessSample = {
 type Summary = {
   scenario: Scenario
   mode: Mode
+  runner: Runner
+  attach: boolean
   target: string
   duration_ms: number
   peak_cpu: number
@@ -45,6 +54,11 @@ type Summary = {
   tree_avg_cpu: number
   tree_peak_rss_mb: number
   tree_avg_rss_mb: number
+  process_kind_counts: Record<ProcessKind, number>
+  process_kind_peak_cpu: Record<ProcessKind, number>
+  process_kind_peak_rss_mb: Record<ProcessKind, number>
+  process_kind_tree_peak_cpu: Record<ProcessKind, number>
+  process_kind_tree_peak_rss_mb: Record<ProcessKind, number>
   llm_requests: number
   sample_count: number
   exit_code: number | number[]
@@ -52,8 +66,10 @@ type Summary = {
 
 const opencodeRoot = path.resolve(import.meta.dir, "..")
 const cliEntry = path.join(opencodeRoot, "src/index.ts")
+const binaryEntry = path.join(opencodeRoot, "dist", `opencode-${process.platform === "win32" ? "windows" : process.platform}-${process.arch}`, "bin", process.platform === "win32" ? "opencode.exe" : "opencode")
 const artifactRoot = path.join(opencodeRoot, ".artifacts/perf")
 const rootPrompt = "perf blackbox cpu ram probe"
+const processKinds: ProcessKind[] = ["wrapper", "opencode", "shell", "git", "lsp", "watcher", "npm", "other"]
 
 const args = parseArgs(Bun.argv.slice(2))
 const started = stamp()
@@ -72,38 +88,58 @@ printAggregate(runs.map((run) => run.summary))
 
 async function runOnce(args: Args, artifactName: string) {
   const artifactDir = path.join(artifactRoot, artifactName)
-  const home = await mkdtemp(path.join(tmpdir(), "opencode-perf-"))
-  const server = createPerfServer(args)
-  const workspace = args.workspace ? path.resolve(args.workspace) : home
+  const homes = await Promise.all(Array.from({ length: args.instances }, () => mkdtemp(path.join(tmpdir(), "opencode-perf-"))))
+  const serverHome = args.attach ? await mkdtemp(path.join(tmpdir(), "opencode-perf-server-")) : undefined
+  const workspace =
+    args.workspace ? path.resolve(args.workspace) : args.scenario === "read-ts" || args.scenario === "lsp-ts" ? opencodeRoot : homes[0]!
+  const llm = createPerfServer(args, workspace)
+  const opencodeServer = serverHome ? await startOpencodeServer(args, serverHome, `http://127.0.0.1:${llm.port}`) : undefined
   await mkdir(artifactDir, { recursive: true })
 
   try {
-    const proc = spawnOpencode(args, isolatedEnv(home, `http://127.0.0.1:${server.port}`), workspace)
+    const procs = homes.map((home) =>
+      spawnOpencode(args, isolatedEnv(args, home, `http://127.0.0.1:${llm.port}`), workspace, opencodeServer?.url),
+    )
     const start = performance.now()
-    const stdout = readStream(proc.stdout)
-    const stderr = readStream(proc.stderr)
+    const stdout = procs.map((proc) => readStream(proc.stdout))
+    const stderr = procs.map((proc) => readStream(proc.stderr))
+    const serverStdout = opencodeServer ? readStream(opencodeServer.stdout) : undefined
+    const serverStderr = opencodeServer ? readStream(opencodeServer.stderr) : undefined
     const samples: ProcessSample[] = []
-    const sampler = sampleProcesses([proc.pid], samples, start, args.sampleMs)
-    const stopWhenSettled = stopInteractiveWhenSettled(args, [proc], server)
-    const timeout = setTimeout(() => terminateProc(proc), args.timeoutMs)
-    const exitCode = await proc.exited
+    const sampler = sampleProcesses(
+      [...procs.map((proc) => proc.pid), ...(opencodeServer ? [opencodeServer.proc.pid] : [])],
+      samples,
+      start,
+      args.sampleMs,
+    )
+    const stopWhenSettled = stopInteractiveWhenSettled(args, procs, llm)
+    const timeout = setTimeout(() => {
+      for (const proc of procs) terminateProc(proc)
+    }, args.timeoutMs)
+    const exitCode = await Promise.all(procs.map((proc) => proc.exited))
     clearTimeout(timeout)
     stopWhenSettled?.()
     clearInterval(sampler)
+    if (opencodeServer) terminateProc(opencodeServer.proc)
 
-    const stdoutText = await stdout
-    const stderrText = await stderr
+    const stdoutText = (await Promise.all(stdout)).join("\n")
+    const stderrText = (await Promise.all(stderr)).join("\n")
     const summary = summarize({
       args,
       durationMs: Math.round(performance.now() - start),
-      exitCode,
-      llmRequests: server.requestCount,
+      exitCode: args.instances === 1 ? exitCode[0]! : exitCode,
+      llmRequests: llm.requestCount,
       samples,
     })
 
-    await writeFile(path.join(artifactDir, "run.json"), JSON.stringify({ args, workspace }, null, 2))
+    await writeFile(
+      path.join(artifactDir, "run.json"),
+      JSON.stringify({ args, workspace, tool_file: toolFile(workspace), opencode_server: opencodeServer?.url }, null, 2),
+    )
     await writeFile(path.join(artifactDir, "stdout.log"), stdoutText)
     await writeFile(path.join(artifactDir, "stderr.log"), stderrText)
+    if (serverStdout) await writeFile(path.join(artifactDir, "opencode-server.stdout.log"), await serverStdout)
+    if (serverStderr) await writeFile(path.join(artifactDir, "opencode-server.stderr.log"), await serverStderr)
     await writeFile(path.join(artifactDir, "processes.jsonl"), samples.map((sample) => JSON.stringify(sample)).join("\n") + "\n")
     await writeFile(path.join(artifactDir, "summary.json"), JSON.stringify(summary, null, 2))
 
@@ -112,12 +148,54 @@ async function runOnce(args: Args, artifactName: string) {
       summary,
     }
   } finally {
-    await server.stop(true)
-    await rm(home, { recursive: true, force: true })
+    if (opencodeServer) terminateProc(opencodeServer.proc)
+    await llm.stop(true)
+    await Promise.all([...homes, ...(serverHome ? [serverHome] : [])].map((home) => rm(home, { recursive: true, force: true })))
   }
 }
 
-function spawnOpencode(args: Args, env: Record<string, string>, workspace: string) {
+type OpencodeServer = {
+  proc: ReturnType<typeof Bun.spawn>
+  url: string
+  port: number
+  stdout: ReadableStream<Uint8Array>
+  stderr: ReadableStream<Uint8Array>
+}
+
+async function startOpencodeServer(args: Args, home: string, llmUrl: string): Promise<OpencodeServer> {
+  const port = await availablePort()
+  const proc = Bun.spawn(opencodeCommand(args, ["serve", "--hostname", "127.0.0.1", "--port", String(port)]), {
+    cwd: opencodeRoot,
+    env: { ...Bun.env, ...isolatedEnv(args, home, llmUrl) },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  const server = { proc, url: `http://127.0.0.1:${port}`, port, stdout: proc.stdout, stderr: proc.stderr }
+  try {
+    await waitForServer(server)
+  } catch (error) {
+    terminateProc(proc)
+    throw error
+  }
+  return server
+}
+
+async function availablePort() {
+  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("ok") })
+  const port = server.port
+  await server.stop(true)
+  if (port === undefined) throw new Error("failed to allocate a port")
+  return port
+}
+
+async function waitForServer(server: OpencodeServer) {
+  await Bun.sleep(20_000)
+  if (server.proc.exitCode === null) return
+  throw new Error(`opencode server exited before clients could attach at ${server.url}`)
+}
+
+function spawnOpencode(args: Args, env: Record<string, string>, workspace: string, attachUrl: string | undefined) {
   const runArgs = [
     "run",
     "--model",
@@ -128,9 +206,11 @@ function spawnOpencode(args: Args, env: Record<string, string>, workspace: strin
   ]
   if (args.mode === "run-json") runArgs.push("--format", "json")
   if (args.mode === "tui") runArgs.push("--interactive")
+  if (attachUrl) runArgs.push("--attach", attachUrl)
+  if (args.title !== undefined) runArgs.push("--title", args.title)
   runArgs.push(rootPrompt)
 
-  const command = ["bun", "run", "--conditions=browser", cliEntry, ...runArgs]
+  const command = opencodeCommand(args, runArgs)
   return Bun.spawn(wrapTtyIfNeeded(args.mode, command), {
     cwd: opencodeRoot,
     env: { ...Bun.env, ...env },
@@ -138,6 +218,11 @@ function spawnOpencode(args: Args, env: Record<string, string>, workspace: strin
     stdout: "pipe",
     stderr: "pipe",
   })
+}
+
+function opencodeCommand(args: Args, commandArgs: string[]) {
+  if (args.runner === "binary") return [binaryEntry, ...commandArgs]
+  return ["bun", "run", "--conditions=browser", cliEntry, ...commandArgs]
 }
 
 function wrapTtyIfNeeded(mode: Mode, command: string[]) {
@@ -149,7 +234,8 @@ function wrapTtyIfNeeded(mode: Mode, command: string[]) {
 
 function stopInteractiveWhenSettled(args: Args, procs: Array<ReturnType<typeof Bun.spawn>>, server: PerfServer) {
   if (args.mode === "run-json") return
-  const expectedCompletions = procs.length * 2
+  const expectedCompletions =
+    procs.length * ((args.scenario === "read-ts" || args.scenario === "lsp-ts" ? 2 : 1) + (args.title === undefined ? 1 : 0))
   let settled: ReturnType<typeof setTimeout> | undefined
   const timer = setInterval(() => {
     if (server.completeCount < expectedCompletions || settled) return
@@ -176,7 +262,7 @@ type PerfServer = ReturnType<typeof Bun.serve> & {
   completeCount: number
 }
 
-function createPerfServer(args: Args) {
+function createPerfServer(args: Args, workspace: string) {
   let requestCount = 0
   let completeCount = 0
 
@@ -192,7 +278,7 @@ function createPerfServer(args: Args) {
       const body = (await request.json().catch(() => undefined)) as Record<string, unknown> | undefined
       requestCount++
 
-      return new Response(streamResponse(args, isTitleRequest(body), () => completeCount++), {
+      return new Response(streamResponse(args, workspace, body, () => completeCount++), {
         headers: {
           "content-type": "text/event-stream",
           "cache-control": "no-cache",
@@ -211,9 +297,21 @@ function isTitleRequest(body: Record<string, unknown> | undefined) {
   return JSON.stringify(body?.messages ?? "").includes("title generator")
 }
 
-function streamResponse(args: Args, titleRequest: boolean, onComplete: () => void) {
+function hasToolResult(body: Record<string, unknown> | undefined) {
+  return JSON.stringify(body?.messages ?? body ?? "").includes('"role":"tool"')
+}
+
+function streamResponse(args: Args, workspace: string, body: Record<string, unknown> | undefined, onComplete: () => void) {
   const encoder = new TextEncoder()
-  const chunks = titleRequest ? [{ content: "Perf title" }] : scenarioDeltas(args)
+  const chunks = isTitleRequest(body)
+    ? [{ content: "Perf title" }]
+    : (args.scenario === "read-ts" || args.scenario === "lsp-ts") && !hasToolResult(body)
+      ? toolScenarioDeltas(args.scenario, workspace)
+      : scenarioDeltas(args)
+  const finishReason =
+    (args.scenario === "read-ts" || args.scenario === "lsp-ts") && !isTitleRequest(body) && !hasToolResult(body)
+      ? "tool_calls"
+      : "stop"
 
   return new ReadableStream({
     async start(controller) {
@@ -226,12 +324,58 @@ function streamResponse(args: Args, titleRequest: boolean, onComplete: () => voi
       for (const delta of chunks) {
         await write(chunk(delta))
       }
-      await write(finishChunk("stop"))
+      await write(finishChunk(finishReason))
       controller.enqueue(encoder.encode("data: [DONE]\n\n"))
       onComplete()
       controller.close()
     },
   })
+}
+
+function toolFile(workspace: string) {
+  return path.join(workspace, "src/index.ts")
+}
+
+function toolScenarioDeltas(scenario: Scenario, workspace: string) {
+  if (scenario === "lsp-ts") {
+    return toolCallDeltas("lsp", {
+      operation: "documentSymbol",
+      filePath: toolFile(workspace),
+      line: 1,
+      character: 1,
+    })
+  }
+
+  return toolCallDeltas("read", { filePath: toolFile(workspace), limit: 80 })
+}
+
+function toolCallDeltas(name: string, input: unknown) {
+  const args = JSON.stringify(input)
+  return [
+    {
+      tool_calls: [
+        {
+          index: 0,
+          id: "call_perf_read",
+          type: "function",
+          function: {
+            name,
+            arguments: "",
+          },
+        },
+      ],
+    },
+    {
+      tool_calls: [
+        {
+          index: 0,
+          function: {
+            arguments: args,
+          },
+        },
+      ],
+    },
+  ]
 }
 
 function scenarioDeltas(args: Args) {
@@ -248,6 +392,10 @@ function scenarioText(scenario: Scenario) {
 
   if (scenario === "code") {
     return "```ts\nconst value = await run();\nconsole.log(value)\n```\n"
+  }
+
+  if (scenario === "read-ts" || scenario === "lsp-ts") {
+    return "tool complete "
   }
 
   return "plain text "
@@ -269,9 +417,9 @@ function finishChunk(reason: string) {
   }
 }
 
-function isolatedEnv(home: string, llmUrl: string) {
+function isolatedEnv(args: Args, home: string, llmUrl: string) {
   const config = testProviderConfig(llmUrl)
-  config.lsp = false
+  config.lsp = args.enableLsp
 
   return {
     OPENCODE_TEST_HOME: home,
@@ -289,6 +437,8 @@ function isolatedEnv(home: string, llmUrl: string) {
     OPENCODE_DISABLE_AUTOUPDATE: "1",
     OPENCODE_DISABLE_AUTOCOMPACT: "1",
     OPENCODE_DISABLE_MODELS_FETCH: "1",
+    OPENCODE_DISABLE_LSP_DOWNLOAD: args.disableLspDownload ? "1" : "0",
+    OPENCODE_EXPERIMENTAL_LSP_TOOL: args.scenario === "lsp-ts" ? "1" : "0",
     OPENCODE_AUTH_CONTENT: "{}",
   }
 }
@@ -314,7 +464,7 @@ function sampleProcesses(parentPids: number[], samples: ProcessSample[], start: 
 }
 
 async function processTable() {
-  const proc = Bun.spawn(["ps", "-axo", "pid=,ppid=,pcpu=,rss=,comm="], { stdout: "pipe", stderr: "ignore" })
+  const proc = Bun.spawn(["ps", "-axo", "pid=,ppid=,pcpu=,rss=,command="], { stdout: "pipe", stderr: "ignore" })
   const output = await new Response(proc.stdout).text()
   await proc.exited
 
@@ -358,8 +508,17 @@ function toSample(row: { pid: number; cpu: number; rss: number; command: string 
 function classifyProcess(command: string, role: "parent" | "child"): ProcessKind {
   const name = command.toLowerCase()
   if (role === "parent") return "wrapper"
+  if (
+    name.includes("typescript-language-server") ||
+    name.includes("tsserver.js") ||
+    name.includes("language-server") ||
+    name.includes("oxlint") ||
+    name.includes("oxc_language_server")
+  )
+    return "lsp"
+  if (name.includes("npm") || name.includes("@npmcli/arborist")) return "npm"
   if (name.includes("opencode") || name.endsWith("/bun") || name === "bun") return "opencode"
-  if (name.endsWith("/git") || name === "git") return "git"
+  if (name.includes("/git ") || name.startsWith("git ") || name.endsWith("/git") || name === "git") return "git"
   if (name.includes("fsevent") || name.includes("watchman")) return "watcher"
   if (name.endsWith("/sh") || name.endsWith("/zsh") || name.endsWith("/bash") || name === "sh" || name === "zsh" || name === "bash") {
     return "shell"
@@ -374,17 +533,24 @@ async function readStream(stream: ReadableStream<Uint8Array>) {
 function summarize(input: {
   args: Args
   durationMs: number
-  exitCode: number
+  exitCode: number | number[]
   llmRequests: number
   samples: ProcessSample[]
 }): Summary {
   const targetSamples = primarySamples(input.args.mode, input.samples)
   const treeCpu = totalsByElapsed(input.samples, (sample) => sample.cpu)
   const treeRss = totalsByElapsed(input.samples, (sample) => sample.rss_mb)
+  const processKindCounts = processKindUniqueCounts(input.samples)
+  const processKindPeakCpu = valuesByKind(input.samples, (sample) => sample.cpu, max)
+  const processKindPeakRss = valuesByKind(input.samples, (sample) => sample.rss_mb, max)
+  const processKindTreePeakCpu = treeValuesByKind(input.samples, (sample) => sample.cpu)
+  const processKindTreePeakRss = treeValuesByKind(input.samples, (sample) => sample.rss_mb)
 
   return {
     scenario: input.args.scenario,
     mode: input.args.mode,
+    runner: input.args.runner,
+    attach: input.args.attach,
     target: input.args.mode === "tui" ? "opencode child" : "run process",
     duration_ms: input.durationMs,
     peak_cpu: max(targetSamples.map((sample) => sample.cpu)),
@@ -395,10 +561,40 @@ function summarize(input: {
     tree_avg_cpu: avg(treeCpu),
     tree_peak_rss_mb: max(treeRss),
     tree_avg_rss_mb: avg(treeRss),
+    process_kind_counts: processKindCounts,
+    process_kind_peak_cpu: processKindPeakCpu,
+    process_kind_peak_rss_mb: processKindPeakRss,
+    process_kind_tree_peak_cpu: processKindTreePeakCpu,
+    process_kind_tree_peak_rss_mb: processKindTreePeakRss,
     llm_requests: input.llmRequests,
     sample_count: targetSamples.length,
     exit_code: input.exitCode,
   }
+}
+
+function emptyKindRecord() {
+  return Object.fromEntries(processKinds.map((kind) => [kind, 0])) as Record<ProcessKind, number>
+}
+
+function processKindUniqueCounts(samples: ProcessSample[]) {
+  return processKinds.reduce<Record<ProcessKind, number>>((result, kind) => {
+    result[kind] = new Set(samples.filter((sample) => sample.kind === kind).map((sample) => sample.pid)).size
+    return result
+  }, emptyKindRecord())
+}
+
+function valuesByKind(samples: ProcessSample[], value: (sample: ProcessSample) => number, aggregate: (values: number[]) => number) {
+  return processKinds.reduce<Record<ProcessKind, number>>((result, kind) => {
+    result[kind] = aggregate(samples.filter((sample) => sample.kind === kind).map(value))
+    return result
+  }, emptyKindRecord())
+}
+
+function treeValuesByKind(samples: ProcessSample[], value: (sample: ProcessSample) => number) {
+  return processKinds.reduce<Record<ProcessKind, number>>((result, kind) => {
+    result[kind] = max(totalsByElapsed(samples.filter((sample) => sample.kind === kind), value))
+    return result
+  }, emptyKindRecord())
 }
 
 function primarySamples(mode: Mode, samples: ProcessSample[]) {
@@ -433,6 +629,8 @@ function printRun(index: number, summary: Summary, artifactDir: string) {
     [
       `run ${index}`,
       `${summary.mode}/${summary.scenario}`,
+      `runner=${summary.runner}`,
+      `attach=${summary.attach}`,
       `target=${summary.target}`,
       `duration=${duration}s`,
       `peak_cpu=${summary.peak_cpu}%`,
@@ -456,6 +654,8 @@ function printAggregate(summaries: Summary[]) {
   console.log(
     [
       `${first.mode}/${first.scenario}`,
+      `runner=${first.runner}`,
+      `attach=${first.attach}`,
       `runs=${summaries.length}`,
       `median_peak_cpu=${median(summaries.map((summary) => summary.peak_cpu))}%`,
       `median_peak_rss=${median(summaries.map((summary) => summary.peak_rss_mb))}MB`,
@@ -476,8 +676,11 @@ function parseArgs(argv: string[]): Args {
   const mode = enumValue(values.get("mode") ?? "tui", ["run-json", "tui"])
   return {
     mode,
-    scenario: enumValue(values.get("scenario") ?? "markdown", ["text", "markdown", "code"]),
+    scenario: enumValue(values.get("scenario") ?? "markdown", ["text", "markdown", "code", "read-ts", "lsp-ts"]),
+    runner: enumValue(values.get("runner") ?? "source", ["source", "binary"]),
     workspace: values.get("workspace"),
+    title: values.get("title"),
+    attach: booleanValue(values.get("attach") ?? "false", "attach"),
     runs: positiveInt(values.get("runs") ?? "1", "runs"),
     chunks: positiveInt(values.get("chunks") ?? "250", "chunks"),
     chunkSize: positiveInt(values.get("chunk-size") ?? "12", "chunk-size"),
@@ -485,6 +688,9 @@ function parseArgs(argv: string[]): Args {
     timeoutMs: positiveInt(values.get("timeout-ms") ?? "20000", "timeout-ms"),
     sampleMs: positiveInt(values.get("sample-ms") ?? "100", "sample-ms"),
     settleMs: positiveInt(values.get("settle-ms") ?? "500", "settle-ms"),
+    instances: positiveInt(values.get("instances") ?? "1", "instances"),
+    enableLsp: booleanValue(values.get("enable-lsp") ?? "false", "enable-lsp"),
+    disableLspDownload: booleanValue(values.get("disable-lsp-download") ?? "false", "disable-lsp-download"),
   }
 }
 
@@ -504,6 +710,12 @@ function nonNegativeInt(value: string, name: string) {
   const number = Number(value)
   if (Number.isInteger(number) && number >= 0) return number
   throw new Error(`--${name} must be a non-negative integer`)
+}
+
+function booleanValue(value: string, name: string) {
+  if (value === "true") return true
+  if (value === "false") return false
+  throw new Error(`--${name} must be true or false`)
 }
 
 function avg(values: number[]) {

@@ -13,6 +13,32 @@ The detailed experiments below are historical results from the earlier, larger h
 
 HTML report: `perf/opencode-runtime-performance-report.html`
 
+## Latest Multi-Instance/LSP Result
+
+- Harness gap fixed: `perf-run.ts` can now run multiple CLI instances, `read-ts` / `lsp-ts` tool scenarios, LSP on/off, source vs compiled binary, and attach mode.
+- 10 local TUI instances with LSP scenario:
+  - artifact: `20260603T083916Z-tui-lsp-ts-run-1`
+  - tree peak CPU: `735.1%`
+  - tree peak RSS: `3017.85MB`
+  - process-kind RSS: `opencode` `2986.18MB`, LSP `208.78MB`
+- 10 attach-mode TUI clients against one shared server:
+  - artifact: `20260603T085711Z-tui-lsp-ts-run-1`
+  - tree peak CPU: `750.1%`
+  - tree peak RSS: `3162.83MB`
+  - conclusion: sharing a server does not solve the 10-client memory curve because client/TUI processes still dominate.
+- Compiled binary 10-instance run:
+  - artifact: `20260603T085847Z-tui-lsp-ts-run-1`
+  - tree peak CPU: `699%`
+  - tree peak RSS: `3119.73MB`
+  - conclusion: source-mode overhead is not the main explanation.
+- Root cause update:
+  - dominant cost is duplicated interactive `opencode`/TUI runtime per CLI process.
+  - LSPs are an amplifier, not the main measured CPU/RSS source in this harness.
+- Kept fix:
+  - TypeScript LSP now honors `OPENCODE_DISABLE_LSP_DOWNLOAD`; this prevents unwanted package lookup/download work but is not expected to solve the main 10-instance TUI memory curve.
+- Rejected fixes:
+  - queue throttling, fixed title, incremental GC, and full GC were measured and not kept because results were noisy, worse, or not reproducible.
+
 ## Current Answer
 
 - Hottest project-owned function: `RunScrollbackStream.writeStreaming`
