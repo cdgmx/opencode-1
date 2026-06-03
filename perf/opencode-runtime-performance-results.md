@@ -286,6 +286,46 @@ These ideas were tested already. They did not materially lower top-line CPU, or 
   - snapshotting inflated RSS, so use the memory composition, not the top-line RSS, from this run.
   - top heap classes at boot: `FunctionCodeBlock` `19.08MB`, `ArrayBuffer` `16.00MB`, `ModuleRecord` `13.03MB`, `JSLexicalEnvironment` `7.53MB`, closures `5.81MB`.
   - interpretation: the fixed floor is mostly module/code/runtime/native residency, not a large retained transcript object graph.
+- Rejected lazy/default TUI config probe:
+  - diagnostic patch removed static `TuiConfig` import from direct run and added `OPENCODE_RUN_TUI_DEFAULT_CONFIG=1`.
+  - normal patched source baseline: `20260603T172634Z-tui-text-run-1`, `tree_peak_cpu=693.8%`, `tree_peak_rss=2610.19MB`
+  - default-config bypass: `20260603T172547Z-tui-text-run-1`, `tree_peak_cpu=729.5%`, `tree_peak_rss=2607.78MB`
+  - conclusion: full TUI config loading is not a material fixed-floor cause in this benchmark.
+- Rejected OpenTUI thread-mode probes on minimal binary:
+  - baseline: `20260603T171416Z-tui-text-run-1`, `tree_peak_cpu=567.5%`, `tree_peak_rss=2543.48MB`
+  - `OPENCODE_RUN_TUI_USE_THREAD=false`: `20260603T172733Z-tui-text-run-1`, `tree_peak_cpu=617.8%`, `tree_peak_rss=2593.64MB`
+  - `OPENCODE_RUN_TUI_USE_THREAD=true`: `20260603T172817Z-tui-text-run-1`, `tree_peak_cpu=614.5%`, `tree_peak_rss=2416.83MB`
+  - conclusion: explicit thread mode can shift memory between child/server/wrapper buckets and improves RSS in one direction, but worsens CPU enough that it is not a clear fix.
+- Rejected splash-skip probe:
+  - diagnostic patch added `OPENCODE_RUN_TUI_DISABLE_SPLASH=1`.
+  - artifact: `20260603T172943Z-tui-text-run-1`, `tree_peak_cpu=717.5%`, `tree_peak_rss=2731.83MB`
+  - normal source baseline: `20260603T172634Z-tui-text-run-1`, `tree_peak_cpu=693.8%`, `tree_peak_rss=2610.19MB`
+  - conclusion: entry/exit splash rendering is not the fixed-floor cause.
+- Rejected direct-run simple theme as a fix:
+  - first probe looked promising:
+    - palette fallback: `20260603T173125Z-tui-text-run-1`, `tree_peak_cpu=507.2%`, `tree_peak_rss=2330.73MB`
+    - 16-color/no-syntax simple theme: `20260603T173241Z-tui-text-run-1`, `tree_peak_cpu=501.0%`, `tree_peak_rss=2411.83MB`
+    - `task-ts` simple theme: `20260603T173335Z-tui-task-ts-run-1`, `tree_peak_cpu=515.7%`, `tree_peak_rss=2130.07MB`
+  - repeat/default validation did not reproduce:
+    - default simple `task-ts`: `20260603T173457Z-tui-task-ts-run-1`, `tree_peak_cpu=682.2%`, `tree_peak_rss=2670.16MB`
+    - default simple minimal: `20260603T173542Z-tui-text-run-1`, `tree_peak_cpu=671.1%`, `tree_peak_rss=2553.73MB`
+  - full theme minimal: `20260603T173620Z-tui-text-run-1`, `tree_peak_cpu=631.2%`, `tree_peak_rss=2453.18MB`
+  - conclusion: theme/palette work may affect timing, but the improvement is not reproducible enough to keep.
+- Long-settle minimal binary split:
+  - artifact: `20260603T173749Z-tui-text-run-1`
+  - command shape: 10 attached TUI clients, binary runner, `text`, `chunks=1`, `settle_ms=10000`
+  - top-line: `tree_peak_cpu=521.7%`, `tree_peak_rss=2659.74MB`
+  - after `>=10000ms`: total opencode CPU averaged `7.1%`, max `23.5%`; RSS averaged `1218.5MB`, max `1246.2MB`
+  - conclusion: minimal-case CPU is mostly startup/turn burst. The persistent problem after idle is resident memory, about `120MB/client` in this late window.
+- Live `vmmap -summary` on one idle binary TUI client:
+  - live client PID during probe: `34672`
+  - physical footprint: `223.9MB`, peak `257.7MB`
+  - major resident regions:
+    - `__TEXT`: `143.5MB`
+    - `WebKit Malloc`: `56.2MB`
+    - `__BUN`: `12.6MB`
+    - normal malloc allocated: `19.4MB`
+  - interpretation: idle resident memory is mostly executable/runtime/native VM footprint, not app-level transcript data or a large JS heap object graph.
 
 ### Revised Hypothesis
 
