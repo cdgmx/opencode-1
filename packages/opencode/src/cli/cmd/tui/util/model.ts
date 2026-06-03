@@ -1,23 +1,23 @@
 import type { Provider } from "@opencode-ai/sdk/v2"
 
-export function index(list: Provider[] | undefined) {
-  return new Map((list ?? []).map((item) => [item.id, item] as const))
+export function parseModel(model: string) {
+  const [providerID, ...rest] = model.split("/")
+  return {
+    providerID,
+    modelID: rest.join("/"),
+  }
 }
 
-export function get(list: Provider[] | ReadonlyMap<string, Provider> | undefined, providerID: string, modelID: string) {
-  const provider =
-    list instanceof Map
-      ? list.get(providerID)
-      : Array.isArray(list)
-        ? list.find((item) => item.id === providerID)
-        : undefined
-  return provider?.models[modelID]
+export function index(providers?: Provider[]) {
+  return new Map((providers ?? []).map((provider) => [provider.id, provider]))
 }
 
-export function name(
-  list: Provider[] | ReadonlyMap<string, Provider> | undefined,
-  providerID: string,
-  modelID: string,
-) {
-  return get(list, providerID, modelID)?.name ?? modelID
+export function name(providers: Provider[] | ReadonlyMap<string, Provider> | undefined, providerID: string, modelID: string) {
+  const provider = Array.isArray(providers)
+    ? providers.find((item) => item.id === providerID)
+    : providers?.get(providerID)
+  if (!provider) return modelID
+  const model = provider.models[modelID]
+  if (!model) return modelID
+  return model.name ? `${provider.name}/${model.name}` : `${provider.name}/${modelID}`
 }

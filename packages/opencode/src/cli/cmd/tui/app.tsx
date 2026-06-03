@@ -53,10 +53,8 @@ import { DialogAlert } from "./ui/dialog-alert"
 import { DialogConfirm } from "./ui/dialog-confirm"
 import { ToastProvider, useToast } from "./ui/toast"
 import { createExit, ExitProvider, useExit, type Exit } from "./context/exit"
-import { Session as SessionApi } from "@/session/session"
 import { TuiEvent } from "./event"
 import { KVProvider, useKV } from "./context/kv"
-import { Provider } from "@/provider/provider"
 import { ArgsProvider, useArgs, type Args } from "./context/args"
 import open from "open"
 import { PromptRefProvider, usePromptRef } from "./context/prompt"
@@ -79,6 +77,8 @@ import {
 
 import type { EventSource } from "./context/sdk"
 import { DialogVariant } from "./component/dialog-variant"
+import { parseModel } from "./util/model"
+import { isDefaultSessionTitle } from "./util/session-title"
 
 const appGlobalBindingCommands = [
   "session.list",
@@ -462,7 +462,7 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
 
     if (route.data.type === "session") {
       const session = sync.session.get(route.data.sessionID)
-      if (!session || SessionApi.isDefaultTitle(session.title)) {
+      if (!session || isDefaultSessionTitle(session.title)) {
         renderer.setTerminalTitle("OpenCode")
         return
       }
@@ -482,7 +482,7 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
     batch(() => {
       if (args.agent) local.agent.set(args.agent)
       if (args.model) {
-        const { providerID, modelID } = Provider.parseModel(args.model)
+        const { providerID, modelID } = parseModel(args.model)
         if (!providerID || !modelID)
           return toast.show({
             variant: "warning",

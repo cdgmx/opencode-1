@@ -14,14 +14,7 @@ import { useArgs } from "./args"
 import { useSDK } from "./sdk"
 import { RGBA } from "@opentui/core"
 import { Filesystem } from "@/util/filesystem"
-
-export function parseModel(model: string) {
-  const [providerID, ...rest] = model.split("/")
-  return {
-    providerID: providerID,
-    modelID: rest.join("/"),
-  }
-}
+import { parseModel } from "../util/model"
 
 export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
   name: "Local",

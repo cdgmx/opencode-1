@@ -48,6 +48,10 @@ function markdownBody(content: string): RunEntryBody {
   }
 }
 
+function shouldStreamAsMarkdown(raw: string) {
+  return /```|`[^`\n]+`/.test(raw) || /(?:^|\n)(?:#{1,6}\s|[-*+]\s|\d+\.\s|>\s|\|.+\|)/.test(raw)
+}
+
 function userBody(raw: string): RunEntryBody {
   if (!raw.trim()) {
     return RUN_ENTRY_NONE
@@ -175,7 +179,7 @@ export function entryBody(commit: StreamCommit): RunEntryBody {
       return commit.interrupted ? textBody("assistant interrupted") : RUN_ENTRY_NONE
     }
 
-    return markdownBody(raw)
+    return shouldStreamAsMarkdown(raw) ? markdownBody(raw) : textBody(raw)
   }
 
   if (commit.kind === "reasoning") {

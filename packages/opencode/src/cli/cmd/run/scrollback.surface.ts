@@ -9,6 +9,7 @@ import {
   MarkdownRenderable,
   TextRenderable,
   getTreeSitterClient,
+  stringToStyledText,
   type TreeSitterClient,
   type CliRenderer,
   type ScrollbackSurface,
@@ -28,6 +29,7 @@ type ActiveEntry = {
   surface: ScrollbackSurface
   renderable: TextRenderable | CodeRenderable | MarkdownRenderable
   content: string
+  bufferedContentLength: number
   committedRows: number
   committedBlocks: number
   pendingSpacerRows: number
@@ -160,6 +162,7 @@ export class RunScrollbackStream {
       surface,
       renderable,
       content: "",
+      bufferedContentLength: 0,
       committedRows: 0,
       committedBlocks: 0,
       pendingSpacerRows: rows || (!this.rendered && this.wrote ? 1 : 0),
@@ -201,7 +204,22 @@ export class RunScrollbackStream {
       }
 
       const renderable = active.renderable
-      renderable.content = active.content
+      const delta = active.content.slice(active.bufferedContentLength)
+      if (delta.length > 0) {
+        if (active.bufferedContentLength === 0) {
+          renderable.content = active.content
+        } else {
+          const incremental = renderable as unknown as {
+            textBuffer: { append: (text: string) => void }
+            _text: ReturnType<typeof stringToStyledText>
+            updateTextInfo: () => void
+          }
+          incremental.textBuffer.append(delta)
+          incremental._text = stringToStyledText(active.content)
+          incremental.updateTextInfo()
+        }
+        active.bufferedContentLength = active.content.length
+      }
       active.surface.render()
       const targetRows = done ? active.surface.height : Math.max(active.committedRows, active.surface.height - 1)
       if (targetRows <= active.committedRows) {
@@ -294,6 +312,15 @@ export class RunScrollbackStream {
   }
 
   private async writeStreaming(commit: StreamCommit, body: ActiveBody): Promise<void> {
+    if (this.active && sameEntryGroup(this.active.commit, commit) && commit.kind === "assistant") {
+      if (this.active.body.type === "markdown" && body.type === "text") {
+        body = {
+          type: "markdown",
+          content: body.content,
+        }
+      }
+    }
+
     if (!this.active || !sameEntryGroup(this.active.commit, commit) || this.active.body.type !== body.type) {
       this.markRendered(await this.finishActive(false))
       this.active = this.createEntry(commit, body)
